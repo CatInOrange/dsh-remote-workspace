@@ -1,0 +1,58 @@
+{
+  "name": "dsh-remote-workspace",
+  "version": "0.1.0-preview.1",
+  "description": "An isolated remote Harness UI panel beside local workspaces",
+  "license": "MIT",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE",
+    "patches"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "vitest run",
+    "pack:release": "npm run build && npm pack"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-layout",
+        "@deepseek-ai/dsh-client-ui-sidebar",
+        "@deepseek-ai/dsh-client-locale"
+      ],
+      "external": [
+        "@deepseek-ai/dsh-client-ui-primitives"
+      ]
+    },
+    "bundle": {
+      "patch": "cordis.patch.yml"
+    }
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2",
+    "jsdom": "29.0.1",
+    "lightningcss": "1.32.0",
+    "vitest": "4.1.12"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/CatInOrange/dsh-remote-workspace.git"
+  },
+  "homepage": "https://github.com/CatInOrange/dsh-remote-workspace#readme",
+  "bugs": {
+    "url": "https://github.com/CatInOrange/dsh-remote-workspace/issues"
+  }
+}
