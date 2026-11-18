@@ -74,7 +74,7 @@ export class NativeSessionAdapter implements ISessions {
     const mapped: SessionReference = {
       sessionId: this.ui(reference.sessionId),
       get binding() {
-        adapter.assertOnline()
+        adapter.assertOpen()
         if (released) throw new Error('Remote Session reference released')
         return adapter.projectBinding(reference.binding)
       },
@@ -95,9 +95,9 @@ export class NativeSessionAdapter implements ISessions {
     try { await reference.ready; return await operation(reference) } finally { reference.release() }
   }
 
-  retainInfo(id: SessionId): ReturnType<ISessions['retainInfo']> { this.assertOnline(); return this.options.remote.retainInfo(this.raw(id)) }
+  retainInfo(id: SessionId): ReturnType<ISessions['retainInfo']> { this.assertOpen(); return this.options.remote.retainInfo(this.raw(id)) }
   subagentAddress(id: SessionId): ReturnType<ISessions['subagentAddress']> {
-    this.assertOnline()
+    this.assertOpen()
     const address = this.options.remote.subagentAddress(this.raw(id))
     return address === undefined ? undefined : { ...address, parentSessionId: this.ui(address.parentSessionId), childSessionId: this.ui(address.childSessionId) }
   }
@@ -138,14 +138,14 @@ export class NativeSessionAdapter implements ISessions {
     return this.ui(id)
   }
 
-  scope(id: SessionId): ReturnType<ISessions['scope']> { this.assertOnline(); return this.options.remote.scope(this.raw(id)) }
+  scope(id: SessionId): ReturnType<ISessions['scope']> { this.assertOpen(); return this.options.remote.scope(this.raw(id)) }
   binding(id: SessionId): ReturnType<ISessions['binding']> {
-    this.assertOnline()
+    this.assertOpen()
     const binding = this.options.remote.binding(this.raw(id))
     return binding === undefined ? undefined : this.projectBinding(binding)
   }
   scopeOf(ctx: Context): ReturnType<ISessions['scopeOf']> {
-    if (this.closed || !this.options.online() || this.options.remote.sessionOf(ctx) === undefined) return undefined
+    if (this.closed || this.options.remote.sessionOf(ctx) === undefined) return undefined
     const id = this.options.remote.scopeOf(ctx)
     return id === undefined || !this.allowed(id) ? undefined : this.ui(id)
   }
@@ -177,8 +177,9 @@ export class NativeSessionAdapter implements ISessions {
     const address = this.options.remote.subagentAddress(id as SessionId)
     return address !== undefined && address.childSessionId === id && this.allowed(address.parentSessionId, visited)
   }
+  private assertOpen(): void { if (this.closed) throw new Error('Remote Session adapter disposed') }
   private assertOnline(): void {
-    if (this.closed) throw new Error('Remote Session adapter disposed')
+    this.assertOpen()
     if (!this.options.online()) throw new Error('Remote workspace offline')
   }
 

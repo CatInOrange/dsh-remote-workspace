@@ -1338,10 +1338,10 @@ index 86b1ad4..42bea06 100644
    retain(target: SessionTarget, options: SessionRetainOptions): SessionReference {
 diff --git a/packages/api/session-controller/src/client/sessions/sources.ts b/packages/api/session-controller/src/client/sessions/sources.ts
 new file mode 100644
-index 0000000..22b6a5c
+index 0000000..945fd88
 --- /dev/null
 +++ b/packages/api/session-controller/src/client/sessions/sources.ts
-@@ -0,0 +1,212 @@
+@@ -0,0 +1,213 @@
 +/** Source-aware Session facade; adapters retain ownership of their remote contexts and IDs. */
 +import type { Context } from '@deepseek-ai/cordis'
 +import type { SessionId } from '@deepseek-ai/dsh-session/types'
@@ -1493,6 +1493,7 @@ index 0000000..22b6a5c
 +        return id
 +      }
 +    }
++    if (this.local.sessionOf(ctx) === undefined) return undefined
 +    const id = this.local.scopeOf(ctx)
 +    if (id !== undefined && this.forSession(id) !== this.local) throw new Error('Foreign Session scope')
 +    return id
@@ -1556,10 +1557,10 @@ index 0000000..22b6a5c
 +}
 diff --git a/packages/api/session-controller/tests/session-sources.client.spec.ts b/packages/api/session-controller/tests/session-sources.client.spec.ts
 new file mode 100644
-index 0000000..f485fc6
+index 0000000..edff46f
 --- /dev/null
 +++ b/packages/api/session-controller/tests/session-sources.client.spec.ts
-@@ -0,0 +1,79 @@
+@@ -0,0 +1,98 @@
 +/** Source catalogs, isolated acquisition, and withdrawal routing. */
 +import { Context } from '@deepseek-ai/cordis'
 +import { describe, expect, it, vi } from 'vitest'
@@ -1638,6 +1639,25 @@ index 0000000..f485fc6
 +      expect(facade.binding(sid('local'))).toBe(local.binding)
 +    } finally { await Promise.all([root.fiber.dispose(), owner.fiber.dispose()]) }
 +  })
++})
++
++it('never resolves a foreign or retired source scope through an identical local tag', async () => {
++  const root = new Context(), owner = new Context()
++  const local = backend('same'), remote = backend('remote:s')
++  const foreign = remote.binding.ctx
++  vi.mocked(local.controller.scopeOf).mockReturnValue(sid('same'))
++  vi.mocked(local.controller.sessionOf).mockImplementation(ctx => ctx === local.binding.ctx ? {} as never : undefined)
++  vi.mocked(remote.controller.scopeOf).mockReturnValue(sid('remote:s'))
++  vi.mocked(remote.controller.sessionOf).mockImplementation(ctx => ctx === foreign ? {} as never : undefined)
++  const facade = new SourceSessions(root, local.controller)
++  try {
++    expect(facade.scopeOf(foreign)).toBeUndefined()
++    facade.registerSource(owner, remote.source)
++    expect(facade.scopeOf(foreign)).toBe('remote:s')
++    await owner.fiber.dispose()
++    expect(facade.scopeOf(foreign)).toBeUndefined()
++    expect(facade.scopeOf(local.binding.ctx)).toBe('same')
++  } finally { await owner.fiber.dispose(); await root.fiber.dispose() }
 +})
 diff --git a/packages/api/workspace-controller/README.i18n.yaml b/packages/api/workspace-controller/README.i18n.yaml
 index e3cb08a..c54c615 100644
