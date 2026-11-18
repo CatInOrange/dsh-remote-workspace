@@ -2518,3 +2518,14 @@ index 466624e..1b163b3 100644
 +    expect(b.remoteQuestions.answer).not.toHaveBeenCalled()
 +  } finally { await b.fiber.dispose(); await owner.fiber.dispose() }
 +})
+diff --git a/tsconfig.client.json b/tsconfig.client.json
+--- a/tsconfig.client.json
++++ b/tsconfig.client.json
+@@ -20,6 +20,7 @@
+     "apps/desktop/src/keybindings.ts",
+     "apps/desktop/src/browser-guests.ts",
+     "apps/desktop/src/ipc.ts",
++    "apps/desktop/src/native-remote-protocol.ts",
+     "apps/desktop/src/update-overlay.ts",
+     "apps/desktop/src/windows-layout.ts",
+     "apps/desktop/tests/**/*.client.spec.tsx",
