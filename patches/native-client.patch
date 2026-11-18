@@ -1,0 +1,2500 @@
+diff --git a/apps/desktop/src/ipc.ts b/apps/desktop/src/ipc.ts
+index 83ebe74..fe2894f 100644
+--- a/apps/desktop/src/ipc.ts
++++ b/apps/desktop/src/ipc.ts
+@@ -1,3 +1,4 @@
++import type { NativeRemoteBridge } from './native-remote-protocol.ts'
+ import type { DesktopFileActions } from '@deepseek-ai/dsh-client-ui-file-actions/types'
+ /** Typed preload operations exposed only by the Electron shell. */
+ 
+@@ -23,6 +24,14 @@ export const DESKTOP_IPC = {
+   onboardingActive: 'dsh-desktop:onboarding-active',
+   onboardingApiKey: 'dsh-desktop:onboarding-api-key',
+   bootFailed: 'dsh-desktop:boot-failed',
++  nativeRemoteConnect: 'dsh-desktop:native-remote-connect',
++  nativeRemoteRelease: 'dsh-desktop:native-remote-release',
++  nativeRemoteRequest: 'dsh-desktop:native-remote-request',
++  nativeRemoteCancel: 'dsh-desktop:native-remote-cancel',
++  nativeRemoteOpen: 'dsh-desktop:native-remote-open',
++  nativeRemoteSend: 'dsh-desktop:native-remote-send',
++  nativeRemoteClose: 'dsh-desktop:native-remote-close',
++  nativeRemoteEvent: 'dsh-desktop:native-remote-event',
+   browserAcquire: 'dsh-desktop:browser-acquire',
+   browserRelease: 'dsh-desktop:browser-release',
+   browserOpenRequested: 'dsh-desktop:browser-open-requested',
+@@ -93,6 +102,7 @@ export interface DesktopUpdatePresentation {
+ export interface DshDesktopProductApi {
+   readonly fileActions: DesktopFileActions
+   readonly protocolVersion: 1
++  readonly nativeRemote: NativeRemoteBridge
+   readonly browser: DesktopBrowserBridge
+   readonly fileDrag: DesktopFileDrag
+   readonly keyboard: DesktopKeyboardApi
+diff --git a/apps/desktop/src/main.ts b/apps/desktop/src/main.ts
+index 9232710..b88ae6b 100644
+--- a/apps/desktop/src/main.ts
++++ b/apps/desktop/src/main.ts
+@@ -13,6 +13,7 @@ import { fileURLToPath } from 'node:url'
+ import {
+   app,
+   BrowserWindow,
++  webContents,
+   clipboard,
+   dialog,
+   ipcMain,
+@@ -65,6 +66,7 @@ import { readDesktopSettings } from './settings.ts'
+ import { readDesktopLocaleCache, writeDesktopLocaleCache } from './locale-cache.ts'
+ import { DesktopUpdateDialog, type UpdateDialogOptions } from './update-dialog.ts'
+ import { readDesktopRuntime } from './runtime-tree.ts'
++import { DesktopNativeRemotes } from './native-remote.ts'
+ import { DesktopBrowserGuests } from './browser-guests.ts'
+ import { installDesktopShortcuts } from './keyboard.ts'
+ import { DesktopUpdateOverlays } from './update-overlay.ts'
+@@ -490,6 +492,10 @@ async function main(): Promise<void> {
+   let hostUrl: string | undefined
+   let hostCookie: string | undefined
+   const browserGuests = new DesktopBrowserGuests(() => hostUrl)
++  const nativeRemotes = new DesktopNativeRemotes((owner, event) => {
++    const target = webContents.fromId(owner)
++    if (target !== undefined && !target.isDestroyed()) target.send(DESKTOP_IPC.nativeRemoteEvent, event)
++  })
+   let injections: readonly unknown[] = []
+   let welcomeBackend: DesktopWelcomeBackend | undefined
+   let reportedLaunch = false
+@@ -834,6 +840,29 @@ async function main(): Promise<void> {
+     reportFatal(new Error(message), 'web-boot')
+   })
+ 
++  ipcMain.handle(DESKTOP_IPC.nativeRemoteConnect, (event, address: unknown, token: unknown) => {
++    assertProductSender(event)
++    return nativeRemotes.connect(event.sender.id, address, token)
++  })
++  ipcMain.handle(DESKTOP_IPC.nativeRemoteRelease, (event, lease: unknown) => {
++    assertProductSender(event); nativeRemotes.release(event.sender.id, lease)
++  })
++  ipcMain.handle(DESKTOP_IPC.nativeRemoteRequest, (event, lease: unknown, request: import('./native-remote-protocol.ts').NativeRemoteRequest) => {
++    assertProductSender(event); return nativeRemotes.request(event.sender.id, lease, request)
++  })
++  ipcMain.handle(DESKTOP_IPC.nativeRemoteCancel, (event, lease: unknown, id: unknown) => {
++    assertProductSender(event); nativeRemotes.cancel(event.sender.id, lease, id)
++  })
++  ipcMain.handle(DESKTOP_IPC.nativeRemoteOpen, (event, lease: unknown, id: unknown) => {
++    assertProductSender(event); nativeRemotes.open(event.sender.id, lease, id)
++  })
++  ipcMain.handle(DESKTOP_IPC.nativeRemoteSend, (event, lease: unknown, id: unknown, data: unknown) => {
++    assertProductSender(event); nativeRemotes.send(event.sender.id, lease, id, data)
++  })
++  ipcMain.handle(DESKTOP_IPC.nativeRemoteClose, (event, lease: unknown, id: unknown) => {
++    assertProductSender(event); nativeRemotes.close(event.sender.id, lease, id)
++  })
++
+   ipcMain.handle(DESKTOP_IPC.browserAcquire, (event, workspace: unknown) => {
+     assertProductSender(event)
+     return browserGuests.acquire(event.sender, workspace)
+@@ -1324,6 +1353,11 @@ async function main(): Promise<void> {
+     mainWindow = window
+     browserGuests.bind(window, (guest, name) => shortcuts.attachGuest(window, guest, name))
+     shortcuts.attach(window)
++    const nativeRemoteOwner = window.webContents.id
++    window.webContents.on('destroyed', () => nativeRemotes.disposeOwner(nativeRemoteOwner))
++    window.webContents.on('did-start-navigation', (_event, _url, inPlace, mainFrame) => {
++      if (mainFrame && !inPlace) nativeRemotes.disposeOwner(nativeRemoteOwner)
++    })
+     window.on('focus', automaticCheck)
+     // Closing hides: the page and the Host keep running, and the next show resumes the same document.
+     window.on('close', (event) => {
+diff --git a/apps/desktop/src/native-remote-connector.ts b/apps/desktop/src/native-remote-connector.ts
+new file mode 100644
+index 0000000..ba650d5
+--- /dev/null
++++ b/apps/desktop/src/native-remote-connector.ts
+@@ -0,0 +1,130 @@
++/** Desktop-owned authentication. Keep aligned with the external native connector contract. */
++function remoteTarget(address: string, _token: string): { address: string; login: string } {
++  const url = new URL(address)
++  if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash || (url.pathname !== '/' && url.pathname !== '')) {
++    throw new Error('Remote address must be an HTTPS origin without credentials')
++  }
++  return { address: url.origin, login: url.origin + '/' }
++}
++
++/** Host-only injectable HTTP transport; never run this cookie owner in a browser panel. */
++export type ConnectorFetch = (url: string, init: RequestInit) => Promise<Response>
++
++/** Host socket factory supplies lifecycle ownership without exposing credentials to the UI. */
++export interface ConnectorSocket<T> {
++  readonly socket: T
++  readonly closed: Promise<void>
++  close(): void
++}
++
++/** One authenticated server connection. Credentials remain private and process-local. */
++export class RemoteHostConnector {
++  readonly address: string
++  #cookie: string | undefined
++  #lifetime = new AbortController()
++  #login: AbortController | undefined
++  #disposed = false
++  #authenticationGeneration = 0
++  #sockets = new Set<ConnectorSocket<unknown>>()
++
++  constructor(address: string, private readonly send: ConnectorFetch = globalThis.fetch) {
++    const target = remoteTarget(address, '')
++    if (target.login !== target.address + '/') throw new Error('Supply credentials only to login')
++    this.address = target.address
++  }
++
++  /** Exchange a native launch token without following redirects or retaining the token. */
++  async login(token: string, signal?: AbortSignal): Promise<void> {
++    this.assertLive()
++    if (!token.trim()) throw new Error('A Harness access token is required')
++    this.#login?.abort()
++    const attempt = new AbortController()
++    this.#login = attempt
++    const requestSignal = AbortSignal.any([this.#lifetime.signal, attempt.signal, ...(signal ? [signal] : [])])
++    const url = new URL(this.address)
++    url.searchParams.set('token', token.trim())
++    let response: Response
++    try {
++      response = await this.send(url.href, { method: 'GET', redirect: 'manual', credentials: 'omit', signal: requestSignal })
++    } catch {
++      throw new Error('Remote authentication request failed')
++    }
++    try {
++      requestSignal.throwIfAborted()
++      if (response.status !== 303 || new URL(response.headers.get('location') ?? '', this.address).href !== this.address + '/') {
++        throw new Error('Remote authentication was refused')
++      }
++      const cookies = response.headers.getSetCookie()
++        .map(value => value.split(';', 1)[0]!)
++        .filter(value => /^dsh-auth-[A-Za-z0-9_-]+=[A-Za-z0-9_.-]+$/.test(value))
++      if (cookies.length !== 1) throw new Error('Remote authentication did not issue a supported cookie')
++      this.#cookie = cookies[0]
++      ++this.#authenticationGeneration
++    } finally {
++      await response.body?.cancel()
++      if (this.#login === attempt) this.#login = undefined
++    }
++  }
++
++  /** Send only native API requests to this server; redirects cannot forward its cookie elsewhere. */
++  async fetch(path: string, init: RequestInit = {}): Promise<Response> {
++    this.assertLive()
++    if (!this.#cookie) throw new Error('Remote connection is not authenticated')
++    // Match Connection's generated channel/endpoint routes, not arbitrary user URLs.
++    if (!/^\/?api\/[A-Za-z0-9_$-]+(?:\.[A-Za-z0-9_$-]+)*(?:\/[A-Za-z0-9_$.-]+)*$/.test(path)
++      || path.split('/').some(part => part === '.' || part === '..')) throw new Error('Unsupported remote API route')
++    const url = new URL(path.replace(/^\//, ''), this.address + '/')
++    const headers = new Headers(init.headers)
++    headers.delete('authorization')
++    headers.set('cookie', this.#cookie)
++    const signal = AbortSignal.any([this.#lifetime.signal, ...(init.signal ? [init.signal] : [])])
++    const generation = this.#authenticationGeneration
++    let response: Response
++    try {
++      response = await this.send(url.href, { ...init, headers, credentials: 'omit', redirect: 'manual', signal })
++    } catch {
++      throw new Error('Remote API transport failed')
++    }
++    if (signal.aborted) {
++      await response.body?.cancel()
++      throw new Error('Remote API request was cancelled')
++    }
++    if (response.status === 401 && generation === this.#authenticationGeneration) this.#cookie = undefined
++    if (response.status >= 300 && response.status < 400) {
++      await response.body?.cancel()
++      throw new Error('Remote API redirects are not supported')
++    }
++    return response
++  }
++
++  /** Open the native multiplexed stream socket using this Host's cookie and exact API path. */
++  openWebSocket<T>(path: string, create: (url: string, cookie: string) => ConnectorSocket<T>): T {
++    this.assertLive()
++    if (!this.#cookie) throw new Error('Remote connection is not authenticated')
++    if (path !== '/api/remote.mux') throw new Error('Unsupported remote socket route')
++    const url = new URL(path, this.address)
++    url.protocol = 'wss:'
++    const owned = create(url.href, this.#cookie)
++    this.#sockets.add(owned)
++    const release = (): void => { this.#sockets.delete(owned) }
++    void owned.closed.then(release, release)
++    return owned.socket
++  }
++
++  /** Forget credentials and cancel owned requests; does not stop server-side tasks. */
++  dispose(): void {
++    if (this.#disposed) return
++    this.#disposed = true
++    this.#cookie = undefined
++    ++this.#authenticationGeneration
++    this.#lifetime.abort()
++    for (const socket of this.#sockets) {
++      try { socket.close() } catch { /* Continue releasing independently owned sockets. */ }
++    }
++    this.#sockets.clear()
++  }
++
++  private assertLive(): void {
++    if (this.#disposed) throw new Error('Remote connector is disposed')
++  }
++}
+diff --git a/apps/desktop/src/native-remote-protocol.ts b/apps/desktop/src/native-remote-protocol.ts
+new file mode 100644
+index 0000000..7d597c1
+--- /dev/null
++++ b/apps/desktop/src/native-remote-protocol.ts
+@@ -0,0 +1,25 @@
++/** Narrow, credential-free renderer carrier for a main-owned remote connection. */
++export interface NativeRemoteRequest {
++  readonly id: string
++  readonly path: string
++  readonly method: 'GET' | 'POST'
++  readonly body?: Uint8Array
++  readonly contentType?: string
++}
++export interface NativeRemoteResponse {
++  readonly status: number
++  readonly contentType: string | null
++  readonly body: Uint8Array
++}
++export type NativeRemoteEvent = { readonly id: string; readonly type: 'open' | 'close' | 'error' }
++  | { readonly id: string; readonly type: 'message'; readonly data: string }
++export interface NativeRemoteBridge {
++  connect(address: string, token: string): Promise<{ readonly lease: string; readonly address: string }>
++  release(lease: string): Promise<void>
++  request(lease: string, request: NativeRemoteRequest): Promise<NativeRemoteResponse>
++  cancel(lease: string, id: string): Promise<void>
++  open(lease: string, id: string): Promise<void>
++  send(lease: string, id: string, data: string): Promise<void>
++  close(lease: string, id: string): Promise<void>
++  subscribe(listener: (event: NativeRemoteEvent) => void): () => void
++}
+diff --git a/apps/desktop/src/native-remote.ts b/apps/desktop/src/native-remote.ts
+new file mode 100644
+index 0000000..78bfcea
+--- /dev/null
++++ b/apps/desktop/src/native-remote.ts
+@@ -0,0 +1,125 @@
++/** Main-process remote leases: never exposes authentication cookies to a renderer. */
++import { randomUUID } from 'node:crypto'
++import WebSocket from 'ws'
++import { RemoteHostConnector } from './native-remote-connector.ts'
++import type { NativeRemoteEvent, NativeRemoteRequest, NativeRemoteResponse } from './native-remote-protocol.ts'
++
++interface Lease {
++  readonly owner: number
++  readonly connector: RemoteHostConnector
++  readonly requests: Map<string, AbortController>
++  readonly sockets: Map<string, WebSocket>
++}
++
++export class DesktopNativeRemotes {
++  private readonly leases = new Map<string, Lease>()
++  private readonly pending = new Map<number, RemoteHostConnector>()
++  constructor(private readonly emit: (owner: number, event: NativeRemoteEvent) => void) {}
++
++  async connect(owner: number, address: unknown, token: unknown): Promise<{ lease: string; address: string }> {
++    if (typeof address !== 'string' || typeof token !== 'string') throw new Error('Invalid remote credentials')
++    if (this.pending.has(owner) || [...this.leases.values()].some(lease => lease.owner === owner)) throw new Error('Release the existing remote connection first')
++    const connector = new RemoteHostConnector(address)
++    this.pending.set(owner, connector)
++    try {
++      await connector.login(token)
++      if (this.pending.get(owner) !== connector) throw new Error('Remote connection cancelled')
++      const lease = randomUUID()
++      this.leases.set(lease, { owner, connector, requests: new Map(), sockets: new Map() })
++      return { lease, address: connector.address }
++    } catch (error) { connector.dispose(); throw error }
++    finally { if (this.pending.get(owner) === connector) this.pending.delete(owner) }
++  }
++
++  release(owner: number, id: unknown): void {
++    const lease = this.owned(owner, id)
++    this.leases.delete(id as string)
++    for (const request of lease.requests.values()) request.abort()
++    lease.connector.dispose()
++  }
++
++  disposeOwner(owner: number): void {
++    this.pending.get(owner)?.dispose()
++    this.pending.delete(owner)
++    for (const [id, lease] of this.leases) if (lease.owner === owner) this.release(owner, id)
++  }
++
++  async request(owner: number, id: unknown, input: NativeRemoteRequest): Promise<NativeRemoteResponse> {
++    const lease = this.owned(owner, id)
++    if (input === null || typeof input !== 'object' || typeof input.path !== 'string'
++      || (input.method !== 'GET' && input.method !== 'POST')
++      || (input.body !== undefined && (!(input.body instanceof Uint8Array) || input.body.byteLength > 32 * 1024 * 1024))
++      || (input.contentType !== undefined && input.contentType !== 'application/json')) throw new Error('Invalid remote request')
++    this.validId(input.id)
++    if (lease.requests.has(input.id) || lease.requests.size >= 32) throw new Error('Remote request limit reached')
++    const abort = new AbortController()
++    lease.requests.set(input.id, abort)
++    try {
++      const response = await lease.connector.fetch(input.path, { method: input.method, signal: abort.signal,
++        ...(input.body === undefined ? {} : { body: input.body as BodyInit }),
++        ...(input.contentType === undefined ? {} : { headers: { 'content-type': input.contentType } }),
++      })
++      const reader = response.body?.getReader()
++      const chunks: Uint8Array[] = []
++      let length = 0
++      try {
++        if (reader !== undefined) for (;;) {
++          const next = await reader.read()
++          if (next.done) break
++          length += next.value.byteLength
++          if (length > 32 * 1024 * 1024) throw new Error('Remote response exceeds carrier limit')
++          chunks.push(next.value)
++        }
++      } finally { await reader?.cancel() }
++      const body = new Uint8Array(length)
++      let offset = 0
++      for (const chunk of chunks) { body.set(chunk, offset); offset += chunk.byteLength }
++      return { status: response.status, contentType: response.headers.get('content-type'), body }
++    } finally { lease.requests.delete(input.id) }
++  }
++
++  cancel(owner: number, leaseId: unknown, id: unknown): void {
++    this.validId(id)
++    this.owned(owner, leaseId).requests.get(id)?.abort()
++  }
++
++  open(owner: number, leaseId: unknown, id: unknown): void {
++    const lease = this.owned(owner, leaseId)
++    this.validId(id)
++    if (lease.sockets.has(id) || lease.sockets.size >= 4) throw new Error('Remote socket limit reached')
++    const socket = lease.connector.openWebSocket('/api/remote.mux', (url, cookie) => {
++      const socket = new WebSocket(url, { headers: { cookie }, followRedirects: false, maxPayload: 32 * 1024 * 1024 })
++      return { socket, closed: new Promise<void>(resolve => socket.once('close', () => resolve())), close: () => socket.close() }
++    })
++    lease.sockets.set(id, socket)
++    const emit = (event: NativeRemoteEvent): void => { if (this.leases.get(leaseId as string) === lease) this.emit(owner, event) }
++    socket.on('open', () => emit({ id, type: 'open' }))
++    socket.on('message', (data, binary) => {
++      if (binary) { socket.close(1003); return }
++      emit({ id, type: 'message', data: data.toString() })
++    })
++    socket.on('error', () => emit({ id, type: 'error' }))
++    socket.on('close', () => { lease.sockets.delete(id); emit({ id, type: 'close' }) })
++  }
++
++  send(owner: number, leaseId: unknown, id: unknown, data: unknown): void {
++    this.validId(id)
++    const socket = this.owned(owner, leaseId).sockets.get(id)
++    if (typeof data !== 'string' || Buffer.byteLength(data) > 32 * 1024 * 1024 || socket?.readyState !== WebSocket.OPEN) throw new Error('Remote socket is not writable')
++    socket.send(data)
++  }
++
++  close(owner: number, leaseId: unknown, id: unknown): void {
++    this.validId(id)
++    this.owned(owner, leaseId).sockets.get(id)?.close()
++  }
++
++  private owned(owner: number, id: unknown): Lease {
++    const lease = typeof id === 'string' ? this.leases.get(id) : undefined
++    if (lease === undefined || lease.owner !== owner) throw new Error('Remote connection lease is unavailable')
++    return lease
++  }
++  private validId(id: unknown): asserts id is string {
++    if (typeof id !== 'string' || !/^[a-zA-Z0-9-]{1,80}$/.test(id)) throw new Error('Invalid remote carrier id')
++  }
++}
+diff --git a/apps/desktop/src/preload-app.ts b/apps/desktop/src/preload-app.ts
+index 6b4e989..de262c0 100644
+--- a/apps/desktop/src/preload-app.ts
++++ b/apps/desktop/src/preload-app.ts
+@@ -10,6 +10,7 @@ import { markDocumentPlatform, syncWindowFullscreen } from './preload-platform.t
+ import { syncNativeTheme } from './preload-theme.ts'
+ import { syncWindowsAppearance } from './preload-windows.ts'
+ import { installMandatoryUpdateOverlay } from './preload-mandatory-overlay.ts'
++import { createNativeRemoteBridge } from './preload-native-remote.ts'
+ import { createDesktopBrowserBridge } from './preload-browser.ts'
+ import type { FileDragHandle } from '@deepseek-ai/dsh-util-file-drag'
+ 
+@@ -22,6 +23,7 @@ function createProductApi(): DshDesktopProductApi {
+         Promise<{ bytes: Uint8Array; mediaType: string }>,
+     },
+     browser: createDesktopBrowserBridge(),
++    nativeRemote: createNativeRemoteBridge(),
+     fileDrag: {
+       prepare: (source, requestId) => ipcRenderer.invoke(DESKTOP_IPC.fileDragPrepare, source, requestId) as
+         Promise<FileDragHandle | undefined>,
+diff --git a/apps/desktop/src/preload-native-remote.ts b/apps/desktop/src/preload-native-remote.ts
+new file mode 100644
+index 0000000..7deed20
+--- /dev/null
++++ b/apps/desktop/src/preload-native-remote.ts
+@@ -0,0 +1,20 @@
++import { ipcRenderer } from 'electron'
++import { DESKTOP_IPC } from './ipc.ts'
++import type { NativeRemoteBridge, NativeRemoteEvent } from './native-remote-protocol.ts'
++/** No arbitrary IPC channel, Electron object, cookie, or native socket reaches the page. */
++export function createNativeRemoteBridge(): NativeRemoteBridge {
++  return {
++    connect: (address, token) => ipcRenderer.invoke(DESKTOP_IPC.nativeRemoteConnect, address, token),
++    release: lease => ipcRenderer.invoke(DESKTOP_IPC.nativeRemoteRelease, lease),
++    request: (lease, request) => ipcRenderer.invoke(DESKTOP_IPC.nativeRemoteRequest, lease, request),
++    cancel: (lease, id) => ipcRenderer.invoke(DESKTOP_IPC.nativeRemoteCancel, lease, id),
++    open: (lease, id) => ipcRenderer.invoke(DESKTOP_IPC.nativeRemoteOpen, lease, id),
++    send: (lease, id, data) => ipcRenderer.invoke(DESKTOP_IPC.nativeRemoteSend, lease, id, data),
++    close: (lease, id) => ipcRenderer.invoke(DESKTOP_IPC.nativeRemoteClose, lease, id),
++    subscribe(listener) {
++      const handle = (_event: Electron.IpcRendererEvent, event: NativeRemoteEvent): void => { listener(event) }
++      ipcRenderer.on(DESKTOP_IPC.nativeRemoteEvent, handle)
++      return () => { ipcRenderer.off(DESKTOP_IPC.nativeRemoteEvent, handle) }
++    },
++  }
++}
+diff --git a/apps/desktop/tests/fixtures/native-remote-bridge-smoke.cjs b/apps/desktop/tests/fixtures/native-remote-bridge-smoke.cjs
+new file mode 100644
+index 0000000..2012706
+--- /dev/null
++++ b/apps/desktop/tests/fixtures/native-remote-bridge-smoke.cjs
+@@ -0,0 +1,49 @@
++/** Built sandboxed preload roundtrip; synthetic IPC only, no application Host or remote server. */
++const { app, BrowserWindow, ipcMain, protocol } = require('electron')
++const { mkdtempSync } = require('node:fs')
++const { tmpdir } = require('node:os')
++const { join, resolve } = require('node:path')
++const assert = require('node:assert/strict')
++app.setPath('userData', mkdtempSync(join(tmpdir(), 'dsh-native-relay-smoke-')))
++app.disableHardwareAcceleration()
++protocol.registerSchemesAsPrivileged([{ scheme: 'dsh-app', privileges: { standard: true, secure: true, supportFetchAPI: true } }])
++const deadline = setTimeout(() => { console.error('native bridge smoke timeout'); app.exit(1) }, 20_000)
++app.whenReady().then(async () => {
++  protocol.handle('dsh-app', () => new Response('<!doctype html><html><body>native relay carrier test</body></html>', { headers: { 'content-type': 'text/html' } }))
++  ipcMain.handle('dsh-desktop:locale-bootstrap', () => ({ languages: ['en'], preference: 'en' }))
++  ipcMain.handle('dsh-desktop:native-remote-connect', (_event, address, token) => {
++    assert.equal(address, 'https://remote.example'); assert.equal(token, 'test-only')
++    return { lease: 'fixture', address }
++  })
++  ipcMain.handle('dsh-desktop:native-remote-request', (_event, lease, request) => {
++    assert.equal(lease, 'fixture'); assert.ok(request.body instanceof Uint8Array)
++    assert.deepEqual([...request.body], [1, 2, 3])
++    return { status: 200, contentType: 'application/octet-stream', body: new Uint8Array([7, 8]) }
++  })
++  ipcMain.handle('dsh-desktop:native-remote-open', (event, lease, id) => {
++    assert.equal(lease, 'fixture')
++    event.sender.send('dsh-desktop:native-remote-event', { id, type: 'open' })
++  })
++  ipcMain.handle('dsh-desktop:native-remote-release', () => {})
++  const window = new BrowserWindow({ show: false, webPreferences: {
++    preload: resolve(__dirname, '../../lib/preload-app.cjs'), sandbox: true, contextIsolation: true, nodeIntegration: false,
++  } })
++  window.webContents.on('preload-error', (_event, _path, error) => { console.error(error); app.exit(1) })
++  await window.loadURL('dsh-app://app/')
++  const result = await window.webContents.executeJavaScript(`(async () => {
++    const bridge = window.dshDesktop.nativeRemote;
++    const lease = await bridge.connect('https://remote.example', 'test-only');
++    const response = await bridge.request(lease.lease, { id: 'q', path: '/api/probe', method: 'POST', body: new Uint8Array([1,2,3]) });
++    const event = await new Promise((resolve, reject) => {
++      const unsubscribe = bridge.subscribe(value => { unsubscribe(); resolve(value) });
++      bridge.open(lease.lease, 'socket').catch(reject);
++    });
++    await bridge.release(lease.lease);
++    return { typedResponse: response.body instanceof Uint8Array, bytes: [...response.body], event, private: !('cookie' in lease) && !('ipcRenderer' in bridge) };
++  })()`)
++  assert.deepEqual(result, { typedResponse: true, bytes: [7, 8], event: { id: 'socket', type: 'open' }, private: true })
++  console.log('native-remote-sandbox-bridge-ok')
++  clearTimeout(deadline)
++  window.destroy()
++  app.quit()
++}).catch(error => { console.error(error); app.exit(1) })
+diff --git a/apps/desktop/tests/native-remote.spec.ts b/apps/desktop/tests/native-remote.spec.ts
+new file mode 100644
+index 0000000..fe5f0db
+--- /dev/null
++++ b/apps/desktop/tests/native-remote.spec.ts
+@@ -0,0 +1,43 @@
++import { afterEach, describe, expect, it, vi } from 'vitest'
++import { DesktopNativeRemotes } from '../src/native-remote.ts'
++const address = 'https://remote.example'
++function setup() {
++  const response = () => new Response(null, { status: 303, headers: { location: '/', 'set-cookie': 'dsh-auth-test=secret; HttpOnly; Secure' } })
++  const fetch = vi.fn(async (_url: string, _init: RequestInit) => response())
++  vi.stubGlobal('fetch', fetch)
++  const emit = vi.fn()
++  const remotes = new DesktopNativeRemotes(emit)
++  return { fetch, remotes }
++}
++afterEach(() => vi.unstubAllGlobals())
++describe('desktop native remote ownership', () => {
++  it('keeps cookies private, restricts leases to owners and blocks duplicate connections', async () => {
++    const { remotes, fetch } = setup()
++    const lease = await remotes.connect(1, address, 'access')
++    expect(Object.keys(lease).sort()).toEqual(['address', 'lease'])
++    await expect(remotes.connect(1, address, 'access')).rejects.toThrow('Release')
++    expect(() => remotes.release(2, lease.lease)).toThrow('unavailable')
++    fetch.mockImplementation(async () => new Response('{}', { headers: { 'content-type': 'application/json' } }))
++    await expect(remotes.request(2, lease.lease, { id: 'q', path: '/api/test', method: 'GET' })).rejects.toThrow('unavailable')
++    const result = await remotes.request(1, lease.lease, { id: 'q', path: '/api/test', method: 'GET' })
++    expect(new TextDecoder().decode(result.body)).toBe('{}')
++    const init = fetch.mock.calls.at(-1)?.[1] as RequestInit | undefined
++    expect(new Headers(init?.headers).get('cookie')).toBe('dsh-auth-test=secret')
++    expect('cookie' in result).toBe(false)
++    await expect(remotes.request(1, lease.lease, { id: 'q', path: 'https://evil.example', method: 'GET' })).rejects.toThrow('Unsupported')
++    remotes.disposeOwner(1)
++    await expect(remotes.request(1, lease.lease, { id: 'q', path: '/api/test', method: 'GET' })).rejects.toThrow('unavailable')
++  })
++  it('cancels an in-flight login on owner navigation without creating a lease', async () => {
++    const { remotes, fetch } = setup()
++    let signal: AbortSignal | undefined
++    fetch.mockImplementation((_url, init) => new Promise<Response>((_resolve, reject) => {
++      signal = init?.signal as AbortSignal
++      signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true })
++    }))
++    const pending = remotes.connect(1, address, 'access')
++    remotes.disposeOwner(1)
++    await expect(pending).rejects.toThrow('authentication request failed')
++    expect(signal?.aborted).toBe(true)
++  })
++})
+diff --git a/packages/api/gateway/README.i18n.yaml b/packages/api/gateway/README.i18n.yaml
+index 4caa0e8..bf34d9b 100644
+--- a/packages/api/gateway/README.i18n.yaml
++++ b/packages/api/gateway/README.i18n.yaml
+@@ -18,8 +18,8 @@
+   en: 6ee072ffebd2eb38
+   zh: 6a8723d13f443d51
+ /deepseek-ai-dsh-api-gateway/client-service-clientremote-ctx-key-remote:
+-  en: 610e48ec8d772f85
+-  zh: 627da164fc8297ba
++  en: 50969fa285f8bfe6
++  zh: e7bda897d9dc7545
+ /deepseek-ai-dsh-api-gateway/model-experience:
+   en: 6cb309d3378f035d
+   zh: 998042a02ee32850
+diff --git a/packages/api/gateway/README.md b/packages/api/gateway/README.md
+index 20f8750..85803d5 100644
+--- a/packages/api/gateway/README.md
++++ b/packages/api/gateway/README.md
+@@ -55,6 +55,8 @@ A disposed Peer is refused before event-stream participation checks. `$events` a
+ 
+ The same `./client` import selects standalone Node ESM `lib/client.node.js` or browser loader factory `lib/client.browser.js`; the Host package root stays separate. The browser carrier accepts the shell-owned stream origin described by [Connection](../../client/connection/README.md#use-this-package); logical stream framing and lifecycle remain unchanged.
+ 
++`createClientRemoteRuntime(ctx, connection)` installs an additional runtime in an independent Client context with its own Typert registry and no existing Remote service. Its returned `ctx` exposes the supplied Connection in an isolated service scope for downstream controllers, while `remote` pins unary calls, generated streams, forwarded events and Host facts to that carrier without consulting the page's Connection. Authentication and Connection construction remain caller-owned. `dispose()` withdraws all runtime contributions, including those mounted by another fiber, and awaits event/stream teardown without stopping another runtime. This transport API does not register remote workspaces or merge Session catalogs.
++
+ `ctx.remote.$mount()` validates and registers a generated Host-for-Client contribution, then installs concrete direct and scoped methods for the calling Cordis fiber. Each namespace is a traced `remote.<namespace>` child Service and unloads after its last method is withdrawn. Duplicate endpoints, namespace collisions, and Client-supplied fields without strict generated codecs fail before methods become callable.
+ 
+ Each unary call checks positional arity, constructs the descriptor's exact named `args`, and sends the typed values through `ctx.connection.rpc.call('/api', endpoint, ...)` without executing Client-side schemas; the Host validates the received wire fields before business invocation. A generated stream method returns a `RemoteStreamHandle<Out, In>` from `dsh-typert-protocol` and opens one logical stream when it is called, through an in-process Connection carrier when available, otherwise through the shared Gateway WebSocket. The handle iterates the downlink once. `send(item)` queues an uplink item, sent after the `open` frame; `end()` half-closes the uplink; `dispose()` sends `cancel` unless a terminal frame has arrived and ends the iteration quietly. Breaking out of the iteration early disposes the handle; after the downlink terminates `send` throws and `end` is ignored. Generated cancellation-aware methods accept a final optional `AbortSignal`; the Client combines it with the contribution mount lifetime before invoking the carrier. The Client delegates unary result conversion to the codec's optional `decode()`. Generated decoders validate nested metadata and native byte types without iterating, copying, or freezing byte payloads. JSON unary results and stream items pass through without Client-side type parsing. Withdrawing a contribution removes its descriptors and methods together, aborts in-flight calls and streams, and makes retained method handles reject.
+diff --git a/packages/api/gateway/README.zh.md b/packages/api/gateway/README.zh.md
+index 008b6af..8e74594 100644
+--- a/packages/api/gateway/README.zh.md
++++ b/packages/api/gateway/README.zh.md
+@@ -53,6 +53,8 @@ Host 组合可通过 `registerRemoteEvents()` 注册唯一的应用事件 source
+ <a id="client-service-clientremote-ctx-key-remote"></a>
+ ## Client 服务：`ClientRemote`（ctx key：`remote`）
+ 
++`createClientRemoteRuntime(ctx, connection)` 在独立 Client Context 中安装额外运行时；该 Context 必须拥有自己的 Typert registry，且尚无 Remote 服务。返回的 `ctx` 在隔离的服务作用域内提供指定 Connection，供下游 Controller 使用；`remote` 将一元调用、生成的流、转发事件和 Host 信息固定到该载体，不读取页面的 Connection。认证和 Connection 的构造仍由调用方负责。`dispose()` 撤销运行时的所有 contribution（包括其他 fiber 挂载的 contribution），并等待事件和流完成清理，不会停止其他运行时。该传输 API 不注册远程工作区，也不合并 Session 目录。
++
+ 同一个 `./client` 导入在 Node 中选择独立的 ESM `lib/client.node.js`，在浏览器中选择 loader factory `lib/client.browser.js`；Host 包根入口保持独立。浏览器载体接受 [Connection](../../client/connection/README.zh.md#use-this-package) 定义的 shell 所拥有的流 origin；逻辑流帧与生命周期保持一致。
+ 
+ `ctx.remote.$mount()` 会校验并注册生成的 Host-for-Client 贡献项，然后为发起调用的 Cordis fiber 安装具体的直接方法和作用域方法。每个 namespace 都是可追踪的 `remote.<namespace>` 子 Service，并在最后一个方法撤回后卸载。重复端点、命名空间冲突，以及缺少生成的严格 codec 的 Client 供值字段，都会在方法可调用前报错。
+diff --git a/packages/api/gateway/src/client/index.ts b/packages/api/gateway/src/client/index.ts
+index 3292afc..cc07272 100644
+--- a/packages/api/gateway/src/client/index.ts
++++ b/packages/api/gateway/src/client/index.ts
+@@ -102,6 +102,8 @@ interface InstalledMethod {
+ 
+ /** Typed Remote service augmented by generated direct namespaces and Gateway stream supervision. */
+ export interface ClientRemote extends TypertClientRemote {
++  /** Forward an explicit event allowlist from an independent runtime to existing UI listeners, preserving source scopes. */
++  $attachEvents?(ctx: Context, remote: ClientRemote, events: readonly TypertRemoteEvent[]): () => void
+   /**
+    * Create an independently cancellable, reconnecting logical stream.
+    * Requires interactions=answer; passive Clients use generated stream methods.
+@@ -143,19 +145,77 @@ export function apply(ctx: Context): void {
+   new ClientRemoteService(ctx)
+ }
+ 
++/** A Remote service and its owned transport/namespace lifetime in an independent Client context. */
++export interface ClientRemoteRuntime {
++  /** Context used to mount the runtime's Session and Workspace controllers. */
++  readonly ctx: Context
++  /** Generated namespaces and streams bound exclusively to the supplied Connection. */
++  readonly remote: ClientRemote
++  /** Withdraw mounted namespaces and await the transport's event and stream teardown. */
++  dispose(): Promise<void>
++}
++
++/**
++ * Install a Remote runtime without consulting an ambient Connection.
++ * The caller supplies an independent Context with its own Typert registry and
++ * Remote namespace scopes; sharing a page's registry would duplicate descriptors.
++ * Authentication and Connection installation remain the caller's responsibility.
++ * @param ctx - independent Client context, with Typert mounted and no Remote service.
++ * @param connection - authenticated carrier exclusively owned by this runtime while installed.
++ * @returns runtime whose disposer also belongs to the supplied context's lifetime.
++ */
++export async function createClientRemoteRuntime(
++  ctx: Context,
++  connection: ConnectionHandle,
++): Promise<ClientRemoteRuntime> {
++  if (ctx.get('remote') !== undefined) throw new Error('client api: Remote runtime requires an independent context')
++  const fiber = ctx.isolate('connection').plugin({
++    name: 'api-gateway.remote-runtime',
++    inject: ['typert'],
++    apply: (runtimeCtx: Context) => {
++      runtimeCtx.provide('connection', connection)
++      new ClientRemoteService(runtimeCtx, connection)
++    },
++  })
++  try {
++    await fiber
++  } catch (error) {
++    await fiber.dispose()
++    throw error
++  }
++  return {
++    ctx: fiber.ctx,
++    remote: ctx.get('remote') as ClientRemote,
++    dispose: async () => { await fiber.dispose() },
++  }
++}
++
++interface EventListenerRegistration {
++  readonly event: TypertRemoteEvent
++  readonly attach: (remote: ClientRemote) => () => void
++}
++interface AttachedEventSource {
++  readonly remote: ClientRemote
++  readonly events: ReadonlySet<TypertRemoteEvent>
++  readonly listeners: Map<EventListenerRegistration, () => void>
++}
+ class ClientRemoteService extends Service implements ClientRemote {
++  private readonly eventListeners = new Set<EventListenerRegistration>()
++  private readonly eventSources = new Set<AttachedEventSource>()
+   private readonly ownerCtx: Context
+   private readonly connection: ConnectionHandle
+   private readonly namespaces = new Map<string, RemoteNamespaceHandle>()
+   private hostFacts: RemoteHostFacts | undefined
+   private readonly streams: RemoteStreamMuxClient
+   private readonly events: ClientRemoteEvents | undefined
++  private readonly mountDisposers = new Set<TypertDisposer>()
++  private closed = false
+   private mutations = Promise.resolve()
+ 
+-  constructor(ctx: Context) {
++  constructor(ctx: Context, private readonly explicitConnection?: ConnectionHandle) {
+     super(ctx, 'remote')
+     this.ownerCtx = ctx
+-    const connection = ctx.get('connection') as ConnectionHandle
++    const connection = explicitConnection ?? ctx.get('connection') as ConnectionHandle
+     this.connection = connection
+     this.streams = new RemoteStreamMuxClient(
+       path => connection.openWebSocket(path),
+@@ -168,9 +228,6 @@ class ClientRemoteService extends Service implements ClientRemote {
+         (endpoint, payload, signal) => this.openRemoteStream(endpoint, payload, signal),
+       )
+     }
+-    // API callers retain a lifecycle socket even when they do not receive events.
+-    // HTTP dispatch never waits for this independent connection attempt.
+-    if (connection.rpc.open === undefined) this.streams.start()
+     let disposed = false
+     let loop: ReturnType<ConnectionHandle['start']> | undefined
+     const start = (): void => {
+@@ -183,15 +240,22 @@ class ClientRemoteService extends Service implements ClientRemote {
+         },
+       })
+     }
+-    const loader = ctx.get('loader') as LoaderReadiness | undefined
+-    if (loader === undefined) start()
+-    else void loader.await().then(start, () => {})
+     ctx.effect(() => async () => {
+       disposed = true
++      this.closed = true
++      await this.enqueue(async () => {
++        for (const dispose of [...this.mountDisposers].reverse()) await dispose()
++      })
+       loop?.stop()
+       await this.events?.dispose()
+       await this.streams.close()
+     }, 'api-gateway.client.transport')
++    // API callers retain a lifecycle socket even when they do not receive events.
++    // HTTP dispatch never waits for this independent connection attempt.
++    if (connection.rpc.open === undefined) this.streams.start()
++    const loader = ctx.get('loader') as LoaderReadiness | undefined
++    if (loader === undefined) start()
++    else void loader.await().then(start, () => {})
+   }
+ 
+   $stream<Item>(options: RemoteStreamOptions<Item>): RemoteStream<Item> {
+@@ -213,6 +277,7 @@ class ClientRemoteService extends Service implements ClientRemote {
+   }
+ 
+   async $mount(contribution: TypertRemoteContribution): ReturnType<TypertClientRemote['$mount']> {
++    if (this.closed) throw new Error('client api: Remote runtime is disposed')
+     const callerCtx = this.ctx
+     const owned = callerCtx.effect(async () => {
+       const dispose = await this.enqueue(() => this.mountContribution(callerCtx, contribution))
+@@ -227,7 +292,37 @@ class ClientRemoteService extends Service implements ClientRemote {
+     listener: TypertClientEventListener<Event>,
+   ): () => void {
+     if (this.events === undefined) throw new Error('client api: forwarded events require interactions=answer')
+-    return this.events.subscribe(this.ctx, event, listener)
++    const local = this.events.subscribe(this.ctx, event, listener)
++    const record: EventListenerRegistration = { event, attach: remote => remote.$on(event, listener) }
++    this.eventListeners.add(record)
++    for (const source of this.eventSources) if (source.events.has(event)) source.listeners.set(record, record.attach(source.remote))
++    let active = true
++    const unsubscribe = (): void => {
++      if (!active) return
++      active = false
++      local()
++      this.eventListeners.delete(record)
++      for (const source of this.eventSources) { source.listeners.get(record)?.(); source.listeners.delete(record) }
++    }
++    this.ctx.effect(() => unsubscribe, 'api-gateway.client.event-listener')
++    return unsubscribe
++  }
++
++  $attachEvents(ctx: Context, remote: ClientRemote, events: readonly TypertRemoteEvent[]): () => void {
++    if (this.closed) throw new Error('client api: Remote runtime is disposed')
++    if (remote === this || remote === this.ctx.get('remote')) throw new Error('Cannot attach a runtime to itself')
++    const source: AttachedEventSource = { remote, events: new Set(events), listeners: new Map() }
++    const detach = (): void => {
++      this.eventSources.delete(source)
++      for (const dispose of source.listeners.values()) dispose()
++      source.listeners.clear()
++    }
++    try {
++      for (const record of this.eventListeners) if (source.events.has(record.event)) source.listeners.set(record, record.attach(remote))
++      this.eventSources.add(source)
++      ctx.effect(() => detach, 'api-gateway.client.event-source')
++      return detach
++    } catch (error) { detach(); throw error }
+   }
+ 
+   /** Open one Remote stream and normalize a worker-local carrier's structural failures. */
+@@ -238,7 +333,7 @@ class ClientRemoteService extends Service implements ClientRemote {
+     uplink?: AsyncIterable<unknown>,
+     noConnection = `client api: ${endpoint} has no active Connection`,
+   ): AsyncIterable<unknown> {
+-    const connection = this.ownerCtx.get('connection') as ConnectionHandle | undefined
++    const connection = this.explicitConnection ?? this.ownerCtx.get('connection') as ConnectionHandle | undefined
+     if (connection === undefined) throw new Error(noConnection)
+     const local = connection.rpc.open?.('/api', endpoint, payload, signal, uplink)
+     return local === undefined
+@@ -256,6 +351,7 @@ class ClientRemoteService extends Service implements ClientRemote {
+     callerCtx: Context,
+     contribution: TypertRemoteContribution,
+   ): Promise<TypertDisposer> {
++    if (this.closed) throw new Error('client api: Remote runtime is disposed')
+     this.validateContribution(contribution)
+     const disposeRemote = callerCtx.typert.remotes.register(contribution)
+     const groups = new Map<string, InvocationDescriptor[]>()
+@@ -274,10 +370,13 @@ class ClientRemoteService extends Service implements ClientRemote {
+       await disposeRemote()
+       throw error
+     }
+-    return async () => {
++    const dispose = async (): Promise<void> => {
++      if (!this.mountDisposers.delete(dispose)) return
+       for (const dispose of installed.reverse()) await dispose()
+       await disposeRemote()
+     }
++    this.mountDisposers.add(dispose)
++    return dispose
+   }
+ 
+   private validateContribution(contribution: TypertRemoteContribution): void {
+@@ -453,7 +552,7 @@ class ClientRemoteService extends Service implements ClientRemote {
+     const endpoint = endpointOf(descriptor)
+     if (!token.active) return withdrawn(endpoint)
+     const prepared = this.prepareInvocation(descriptor, projection, token, callerCtx, values, boundIdentity)
+-    const connection = this.ownerCtx.get('connection') as ConnectionHandle | undefined
++    const connection = this.explicitConnection ?? this.ownerCtx.get('connection') as ConnectionHandle | undefined
+     if (connection === undefined) throw new Error(`client api: ${endpoint} has no active Connection`)
+     try {
+       const result = await connection.rpc.call('/api', endpoint, { args: prepared.args }, prepared.signal)
+diff --git a/packages/api/gateway/tests/remote-runtime.client.spec.ts b/packages/api/gateway/tests/remote-runtime.client.spec.ts
+new file mode 100644
+index 0000000..df058cb
+--- /dev/null
++++ b/packages/api/gateway/tests/remote-runtime.client.spec.ts
+@@ -0,0 +1,233 @@
++/** Independent native Client runtimes never borrow the page's local Connection. */
++import { Context } from '@deepseek-ai/cordis'
++import { installConnection, type ConnectionHandle } from '@deepseek-ai/dsh-client-connection/client'
++import TypertRegistry from '@deepseek-ai/dsh-typert-registry'
++import type { RemoteResult, RemoteStreamHandle, TypertRemoteNamespace } from '@deepseek-ai/dsh-typert-protocol'
++import { describe, expect, it, vi } from 'vitest'
++import { z } from 'zod'
++import { createClientRemoteRuntime, type ClientRemoteRuntime } from '../src/client/index.ts'
++
++declare module '@deepseek-ai/dsh-typert-protocol' {
++  interface TypertRemoteMap {
++    'runtimeProbe/read': () => Promise<RemoteResult<string>>
++    'runtimeProbe/watch': () => RemoteStreamHandle<string, never>
++  }
++  interface TypertRemoteNamespaceMap {
++    runtimeProbe: TypertRemoteNamespace<'runtimeProbe'>
++  }
++  interface TypertRemoteEventSelection extends Record<'runtime-probe/changed', true> {}
++}
++
++declare module '@deepseek-ai/cordis' {
++  interface Events {
++    /** @param value - remote runtime marker. @mode emit */
++    'runtime-probe/changed'(value: string): void
++  }
++}
++
++async function fixture(name: string) {
++  const ctx = new Context()
++  const carrier = new Context()
++  const publish = Promise.withResolvers<void>()
++  const calls: string[] = []
++  const streams: string[] = []
++  const closed: string[] = []
++  const carrierState = { offline: false }
++  const ambient = vi.fn<ConnectionHandle['rpc']['call']>()
++  installConnection(ctx, {
++    interactions: 'none',
++    transport: { rpc: { call: ambient, open: async function* () { throw new Error('ambient stream used') } } },
++  })
++  installConnection(carrier, {
++    interactions: 'answer',
++    transport: {
++      rpc: {
++        call: async (_channel, endpoint) => {
++          calls.push(endpoint)
++          if (carrierState.offline) throw new Error('remote carrier offline')
++          return { ok: true, value: name }
++        },
++        open: async function* (_channel, endpoint, _payload, signal) {
++          streams.push(endpoint)
++          const stopped = new Promise<void>(resolve => {
++            if (signal.aborted) resolve()
++            else signal.addEventListener('abort', () => { resolve() }, { once: true })
++          })
++          try {
++            if (endpoint === '$events') {
++              yield { type: 'ready', clientId: name, host: { home: `/hosts/${name}` } }
++              await Promise.race([publish.promise, stopped])
++              if (signal.aborted) return
++              yield { type: 'emit', event: 'runtime-probe/changed', args: [name] }
++            } else {
++              yield name
++            }
++            await stopped
++          } finally {
++            closed.push(endpoint)
++          }
++        },
++      },
++    },
++  })
++  let runtime: ClientRemoteRuntime | undefined
++  const dispose = async () => {
++    publish.resolve()
++    await runtime?.dispose()
++    await ctx.fiber.dispose()
++    await carrier.fiber.dispose()
++  }
++  try {
++    await ctx.plugin(TypertRegistry)
++    runtime = await createClientRemoteRuntime(ctx, carrier.get('connection') as ConnectionHandle)
++    await runtime.remote.$mount({
++      package: '@fixture/runtime',
++      descriptors: ['read', 'watch'].map(method => ({
++        id: `@fixture/runtime#runtimeProbe/${method}`, service: 'runtimeProbe', namespace: 'runtimeProbe', method,
++        invocation: { kind: 'direct' }, parameters: [], ...(method === 'watch' ? { mode: 'stream' as const } : {}),
++        result: { mode: 'strict', typeSymbol: '@fixture#String', create: () => z.string() },
++      })),
++    })
++    return { ctx, runtime, calls, streams, closed, ambient, publish, carrierState, dispose }
++  } catch (error) {
++    await dispose()
++    throw error
++  }
++}
++
++describe('independent native Remote runtime', () => {
++  it('withdraws a partially started runtime when its Connection refuses startup', async () => {
++    const ctx = new Context()
++    const unregister = vi.fn()
++    const connection: ConnectionHandle = {
++      interactions: 'answer', isLoopback: false,
++      generation: { getSnapshot: () => undefined, subscribe: () => () => {} },
++      state: { getSnapshot: () => undefined, subscribe: () => () => {} },
++      rpc: { call: vi.fn(), open: async function* () {} },
++      openWebSocket: () => { throw new Error('unexpected socket') },
++      reconnect: () => {},
++      registerGenerationSource: () => unregister,
++      start: () => { throw new Error('Connection already running') },
++    }
++    try {
++      await ctx.plugin(TypertRegistry)
++      await expect(createClientRemoteRuntime(ctx, connection)).rejects.toThrow('Connection already running')
++      expect(ctx.get('remote')).toBeUndefined()
++      expect(unregister).toHaveBeenCalledExactlyOnceWith()
++    } finally {
++      await ctx.fiber.dispose()
++    }
++  })
++
++  it('reports an offline explicit carrier without trying the ambient local carrier', async () => {
++    const remote = await fixture('linux')
++    try {
++      remote.carrierState.offline = true
++      await expect(remote.runtime.remote.runtimeProbe.read()).resolves.toMatchObject({
++        ok: false, error: { code: 'gateway/internal', message: expect.stringContaining('remote carrier offline') },
++      })
++      expect(remote.ambient).not.toHaveBeenCalled()
++      remote.carrierState.offline = false
++      await expect(remote.runtime.remote.runtimeProbe.read()).resolves.toEqual({ ok: true, value: 'linux' })
++    } finally {
++      await remote.dispose()
++    }
++  })
++
++  it('pins unary, stream, Host facts and forwarded events to each explicit carrier', async () => {
++    const local = await fixture('local')
++    const remote = await fixture('linux')
++    try {
++      const localEvent = vi.fn()
++      const remoteEvent = vi.fn()
++      local.runtime.remote.$on('runtime-probe/changed', localEvent)
++      remote.runtime.remote.$on('runtime-probe/changed', remoteEvent)
++      local.publish.resolve()
++      remote.publish.resolve()
++      await expect(local.runtime.remote.runtimeProbe.read()).resolves.toEqual({ ok: true, value: 'local' })
++      await expect(remote.runtime.remote.runtimeProbe.read()).resolves.toEqual({ ok: true, value: 'linux' })
++      const stream = remote.runtime.remote.runtimeProbe.watch()
++      const iterator = stream[Symbol.asyncIterator]()
++      expect(await iterator.next()).toEqual({ value: 'linux', done: false })
++      stream.dispose()
++      await iterator.return?.()
++      await vi.waitFor(() => {
++        expect(localEvent).toHaveBeenCalledExactlyOnceWith('local')
++        expect(remoteEvent).toHaveBeenCalledExactlyOnceWith('linux')
++      })
++      expect(local.runtime.remote.$host).toEqual({ home: '/hosts/local', isLoopback: true })
++      expect(remote.runtime.remote.$host).toEqual({ home: '/hosts/linux', isLoopback: true })
++      expect(local.calls).toEqual(['runtimeProbe/read'])
++      expect(remote.calls).toEqual(['runtimeProbe/read'])
++      expect(local.streams).toEqual(['$events'])
++      expect(remote.streams).toEqual(['$events', 'runtimeProbe/watch'])
++      expect(local.ambient).not.toHaveBeenCalled()
++      expect(remote.ambient).not.toHaveBeenCalled()
++      expect(remote.runtime.ctx.get('connection')?.rpc.call).not.toBe(remote.ambient)
++    } finally {
++      await Promise.all([local.dispose(), remote.dispose()])
++    }
++  })
++
++  it('disposes one runtime without unmounting or cancelling the other runtime', async () => {
++    const local = await fixture('local')
++    const remote = await fixture('linux')
++    try {
++      const borrowed = remote.runtime.remote.runtimeProbe.read
++      await vi.waitFor(() => { expect(remote.streams).toContain('$events') })
++      await remote.runtime.dispose()
++      expect(remote.ctx.get('remote')).toBeUndefined()
++      expect(remote.ctx.get('remote.runtimeProbe')).toBeUndefined()
++      expect(remote.runtime.ctx.get('connection')).toBeUndefined()
++      expect(remote.ctx.get('connection')?.rpc.call).toBe(remote.ambient)
++      expect(remote.ctx.typert.remotes.get('runtimeProbe/read')).toBeUndefined()
++      expect(remote.closed).toContain('$events')
++      await expect(borrowed()).resolves.toMatchObject({ ok: false, error: { code: 'gateway/internal' } })
++      await expect(local.runtime.remote.runtimeProbe.read()).resolves.toEqual({ ok: true, value: 'local' })
++      expect(local.closed).not.toContain('$events')
++      expect(remote.ambient).not.toHaveBeenCalled()
++      await expect(remote.runtime.remote.$mount({ package: '@fixture/late', descriptors: [] }))
++        .rejects.toThrow('disposed')
++    } finally {
++      await Promise.all([local.dispose(), remote.dispose()])
++    }
++  })
++
++  it('refuses reuse of a context that already has a Remote service', async () => {
++    const existing = await fixture('local')
++    try {
++      await expect(createClientRemoteRuntime(existing.ctx, existing.ctx.get('connection') as ConnectionHandle))
++        .rejects.toThrow('independent context')
++      await expect(existing.runtime.remote.runtimeProbe.read()).resolves.toEqual({ ok: true, value: 'local' })
++    } finally {
++      await existing.dispose()
++    }
++  })
++})
++
++it('attaches allowlisted events to existing UI listeners without changing unary ownership', async () => {
++  const local = await fixture('local'), remote = await fixture('linux')
++  try {
++    const observed = vi.fn()
++    local.runtime.remote.$on('runtime-probe/changed', observed)
++    const detach = local.runtime.remote.$attachEvents!(local.runtime.ctx, remote.runtime.remote, ['runtime-probe/changed'])
++    remote.publish.resolve()
++    await vi.waitFor(() => expect(observed).toHaveBeenCalledExactlyOnceWith('linux'))
++    await expect(local.runtime.remote.runtimeProbe.read()).resolves.toEqual({ ok: true, value: 'local' })
++    expect(remote.calls).toEqual([])
++    detach()
++  } finally { await remote.dispose(); await local.dispose() }
++})
++it('withdraws attached event listeners before disposing their independent transport', async () => {
++  const local = await fixture('local'), remote = await fixture('linux')
++  try {
++    const observed = vi.fn(), received = vi.fn()
++    const detach = local.runtime.remote.$attachEvents!(local.runtime.ctx, remote.runtime.remote, ['runtime-probe/changed'])
++    local.runtime.remote.$on('runtime-probe/changed', observed)
++    remote.runtime.remote.$on('runtime-probe/changed', received)
++    detach()
++    remote.publish.resolve()
++    await vi.waitFor(() => expect(received).toHaveBeenCalledExactlyOnceWith('linux'))
++    expect(observed).not.toHaveBeenCalled()
++  } finally { await remote.dispose(); await local.dispose() }
++})
+diff --git a/packages/api/remote-access/src/client/index.ts b/packages/api/remote-access/src/client/index.ts
+index f3e5123..5f62571 100644
+--- a/packages/api/remote-access/src/client/index.ts
++++ b/packages/api/remote-access/src/client/index.ts
+@@ -21,6 +21,8 @@ import { parseInjectedBaseline } from './state.ts'
+ export type {
+   RemoteAccessAction, RemoteAccessEndpoint, RemoteAccessFrame, RemoteAccessGrant, RemoteAccessResource, TypertResourceKind,
+ } from '../types.ts'
++export { mountAccess as mountClientAccess } from './mount.ts'
++export type { RemoteAccessSource } from './sources.ts'
+ export type { AccessEffect, ClientRemoteAccess, RemoteEndpoint } from './mount.ts'
+ 
+ /** Required Client services: the Remote mount face and the Slot registry. */
+diff --git a/packages/api/remote-access/src/client/mount.ts b/packages/api/remote-access/src/client/mount.ts
+index 68b868a..2f62dbe 100644
+--- a/packages/api/remote-access/src/client/mount.ts
++++ b/packages/api/remote-access/src/client/mount.ts
+@@ -19,6 +19,7 @@ import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
+ import type { TypertRemoteContribution, TypertRemoteMap, TypertResourceKind } from '@deepseek-ai/dsh-typert-protocol'
+ import type { RemoteAccessFrame } from '../types.ts'
+ import { ClientAccessState, type Baseline } from './state.ts'
++import { ResourceAccessSources, type RemoteAccessSource } from './sources.ts'
+ import { whenAllowed, type AccessEffect } from './when-allowed.ts'
+ 
+ export type { AccessEffect } from './when-allowed.ts'
+@@ -28,6 +29,8 @@ export type RemoteEndpoint = Extract<keyof TypertRemoteMap, string>
+ 
+ /** Client access answers over the calling Peer's snapshot; it never issues a request. */
+ export interface ClientRemoteAccess {
++  /** Register source-specific resource permissions; retired identities deny instead of using local grants. */
++  registerSource?(ctx: Context, source: RemoteAccessSource): () => void
+   /**
+    * Whether the current Peer may call `action` on one resource.
+    * True for the owner; false without a baseline and after a non-owner
+@@ -84,25 +87,29 @@ type IncrementFrame = Exclude<RemoteAccessFrame, { type: 'baseline' }>
+ 
+ /** The `remoteAccess` Client service over one snapshot owner. */
+ class ClientRemoteAccessService extends Service implements ClientRemoteAccess {
++  private readonly sources: ResourceAccessSources
+   /**
+    * @param ctx - Client Context the service is provided on.
+    * @param state - snapshot owner answering every source.
+    */
+   constructor(ctx: Context, private readonly state: ClientAccessState) {
+     super(ctx, 'remoteAccess')
++    this.sources = new ResourceAccessSources((kind, id, action) => state.resource(kind, id, action))
+   }
+ 
+   source(kind: TypertResourceKind, id: string, action: string): HostObservable<boolean> {
+-    return this.state.resource(kind, id, action)
++    return this.sources.source(kind, id, action)
+   }
+ 
++  registerSource(ctx: Context, source: RemoteAccessSource): () => void { return this.sources.register(ctx, source) }
++
+   // Prototype methods: the Cordis service proxy binds `this.ctx` to the caller's Context.
+   whenAccess(action: RemoteEndpoint, callback: () => AccessEffect): () => void {
+     return whenAllowed(this.ctx, this.state.global(action), callback, `remoteAccess.whenAccess(${JSON.stringify(action)})`)
+   }
+ 
+   whenResourceAccess(kind: TypertResourceKind, id: string, action: RemoteEndpoint, callback: () => AccessEffect): () => void {
+-    return whenAllowed(this.ctx, this.state.resource(kind, id, action), callback,
++    return whenAllowed(this.ctx, this.source(kind, id, action), callback,
+       `remoteAccess.whenResourceAccess(${JSON.stringify(kind)}, ${JSON.stringify(id)}, ${JSON.stringify(action)})`)
+   }
+ }
+@@ -121,10 +128,11 @@ export async function mountAccess(
+   ctx: Context,
+   contribution: TypertRemoteContribution,
+   initial?: Baseline,
++  options: { readonly publishRoot?: boolean } = {},
+ ): Promise<() => Promise<void>> {
+   const state = new ClientAccessState(initial)
+   new ClientRemoteAccessService(ctx, state)
+-  ctx.slots.provideRoot({
++  if (options.publishRoot !== false) ctx.slots.provideRoot({
+     keyedHooks: { remoteAccess: action => state.global(action) },
+   } satisfies RootStandardSourceContribution)
+   const unmount = await ctx.remote.$mount(contribution)
+diff --git a/packages/api/remote-access/src/client/sources.ts b/packages/api/remote-access/src/client/sources.ts
+new file mode 100644
+index 0000000..dba4eb9
+--- /dev/null
++++ b/packages/api/remote-access/src/client/sources.ts
+@@ -0,0 +1,57 @@
++/** Resource access routing. A withdrawn source keeps its identity reservation and denies access. */
++import type { Context } from '@deepseek-ai/cordis'
++import type { HostObservable } from '@deepseek-ai/dsh-client-ui-slots'
++import type { TypertResourceKind } from '@deepseek-ai/dsh-typert-protocol'
++
++export interface RemoteAccessSource {
++  readonly key: string
++  owns(kind: TypertResourceKind, id: string): boolean
++  source(kind: TypertResourceKind, id: string, action: string): HostObservable<boolean>
++}
++const denied: HostObservable<boolean> = { getSnapshot: () => false, subscribe: () => () => {} }
++/** Stable outward sources switch subscriptions when a resource owner is registered or withdrawn. */
++export class ResourceAccessSources {
++  private readonly entries: { source: RemoteAccessSource; active: boolean }[] = []
++  private readonly listeners = new Set<() => void>()
++  private readonly cache = new Map<string, HostObservable<boolean>>()
++  constructor(private readonly local: RemoteAccessSource['source']) {}
++
++  source(kind: TypertResourceKind, id: string, action: string): HostObservable<boolean> {
++    const key = JSON.stringify([kind, id, action])
++    const cached = this.cache.get(key)
++    if (cached !== undefined) return cached
++    const current = (): HostObservable<boolean> => {
++      const owners = this.entries.filter(entry => entry.source.owns(kind, id))
++      if (owners.length > 1) throw new Error('Ambiguous resource access source')
++      const owner = owners[0]
++      return owner === undefined ? this.local(kind, id, action) : owner.active ? owner.source.source(kind, id, action) : denied
++    }
++    const observable: HostObservable<boolean> = {
++      getSnapshot: () => current().getSnapshot(),
++      subscribe: listener => {
++        let selected = current()
++        let unsubscribe = selected.subscribe(listener)
++        const rebind = (): void => {
++          const next = current()
++          if (next !== selected) { unsubscribe(); selected = next; unsubscribe = next.subscribe(listener) }
++          listener()
++        }
++        this.listeners.add(rebind)
++        return () => { this.listeners.delete(rebind); unsubscribe() }
++      },
++    }
++    this.cache.set(key, observable)
++    return observable
++  }
++
++  register(ctx: Context, source: RemoteAccessSource): () => void {
++    if (!source.key || this.entries.some(entry => entry.source.key === source.key)) throw new Error('Resource access source key already reserved')
++    const entry = { source, active: true }
++    this.entries.push(entry)
++    const notify = (): void => { for (const listener of [...this.listeners]) listener() }
++    const withdraw = (): void => { if (!entry.active) return; entry.active = false; notify() }
++    ctx.effect(() => withdraw, `remote-access.source.${source.key}`)
++    notify()
++    return withdraw
++  }
++}
+diff --git a/packages/api/remote-access/tests/resource-sources.client.spec.ts b/packages/api/remote-access/tests/resource-sources.client.spec.ts
+new file mode 100644
+index 0000000..a286fb8
+--- /dev/null
++++ b/packages/api/remote-access/tests/resource-sources.client.spec.ts
+@@ -0,0 +1,25 @@
++import { Context } from '@deepseek-ai/cordis'
++import { createSnapshotStore } from '@deepseek-ai/dsh-client-store'
++import { ResourceAccessSources } from '../src/client/sources.ts'
++import { expect, it, vi } from 'vitest'
++it('switches an existing access source to remote grants and denies it after withdrawal without local fallback', async () => {
++  const ctx = new Context()
++  const local = createSnapshotStore(true), remote = createSnapshotStore(false)
++  const sources = new ResourceAccessSources(() => local)
++  const outward = sources.source('session', 'mapped', 'session/prompt')
++  const listener = vi.fn()
++  const unsubscribe = outward.subscribe(listener)
++  try {
++    expect(outward.getSnapshot()).toBe(true)
++    const withdraw = sources.register(ctx, { key: 'remote', owns: (_kind, id) => id === 'mapped', source: () => remote })
++    expect(outward.getSnapshot()).toBe(false)
++    remote.set(true); expect(outward.getSnapshot()).toBe(true)
++    expect(listener).toHaveBeenCalledTimes(2)
++    withdraw(); expect(outward.getSnapshot()).toBe(false)
++    expect(sources.source('session', 'local', 'session/prompt').getSnapshot()).toBe(true)
++    expect(sources.source('session', 'mapped', 'session/prompt')).toBe(outward)
++    const count = listener.mock.calls.length
++    remote.set(false); local.set(false)
++    expect(listener).toHaveBeenCalledTimes(count)
++  } finally { unsubscribe(); await ctx.fiber.dispose() }
++})
+diff --git a/packages/api/remote-access/tsconfig.client.json b/packages/api/remote-access/tsconfig.client.json
+index c365c4f..a684abf 100644
+--- a/packages/api/remote-access/tsconfig.client.json
++++ b/packages/api/remote-access/tsconfig.client.json
+@@ -9,6 +9,7 @@
+     "src/client/index.ts",
+     "src/client/mount.ts",
+     "src/client/state.ts",
++    "src/client/sources.ts",
+     "src/client/when-allowed.ts",
+     "src/snapshot.ts",
+     "src/types.ts"
+diff --git a/packages/api/session-controller/README.md b/packages/api/session-controller/README.md
+index f414ce7..95b2a47 100644
+--- a/packages/api/session-controller/README.md
++++ b/packages/api/session-controller/README.md
+@@ -83,6 +83,9 @@ The controller composes `ArchivedSessionGate` through `ctx.plugin`: it loads onc
+ <a id="client-references"></a>
+ ## Client references
+ 
++The Client controller composes registered mapped sources through `ctx.sessions.registerSource?.(owner, source)`. A source provides an independent `ISessions` adapter, stable ownership predicates for Session and Workspace identities, and a unique key for the facade lifetime. The adapter must translate all identity-bearing metadata and preserve its own binding Context; the facade never constructs remote bindings through the local SessionManager. Catalogs compose into the existing list. Identity-addressed commands route to their owning controller; mixed-source create reuse and subagent addresses are refused. Withdrawal removes rows, releases facade-owned references, and reserves the withdrawn identity family so stale navigation cannot call the local Host. Search remains local; root permissions, attachments, model catalogs and source-selection UI require their own integration.
++
++
+ `sessions.retain(target, { source, signal? })` immediately acquires one exact Client generation and starts its shared initial history opening. The target is a known Session id or a durable direct-parent subagent address; the Host validates an explicit address when history opens. The returned reference supports idempotent `release()` and `Symbol.dispose`; its `ready` Promise follows the shared `Session.open()` result and resolves to the exact binding when that attempt settles, including when a Remote failure is represented by `openState: 'error'`. It rejects when `Session.open()` rejects, its waiter is cancelled, or the reference is released early. Cancelling one waiter does not cancel another owner's opening. `sessions.using(target, options, operation)` waits for that settlement, holds its reference until the callback settles, and propagates rejected readiness and callback failures.
+ 
+ References keep local Session data, scoped Contexts, and history streams alive, not Host Agents. Ordinary Session retention never adds a catalog row. Retained subagents with a known direct-parent address keep a fallback row and notify list readers even before the parent catalog arrives; these rows do not join Host-list membership. Fork-title assignment sends rename directly and applies the returned title projection without retaining the child or opening its history. Final release withdraws the generation before teardown; later acquisition can create a new generation with the same id. `binding(id)` and `scope(id)` only borrow an existing generation. `retainInfo(id)` observes stable read-only source counts independently of catalog membership and performs no history I/O. Consumer source keys are declaration-merge extensible; navigation and completion acknowledgement belong to UI consumers, not this Controller. See [Client Session references](../../../.agents/notes/implemented/architecture/2026-09-15-client-session-references.md) for ownership and teardown rules. An unknown-mode subagent address permits history reads with direct-parent consistency validation; access is checked separately on the child Session. Successful descriptor restoration determines the displayed mode; failures remain local to the child. Control requests carry only the target id, and the Host checks continuation availability. Client snapshots retain only the subagent address; runtime admission owns continuation availability.
+diff --git a/packages/api/session-controller/README.zh.md b/packages/api/session-controller/README.zh.md
+index 2a83f45..1e912ee 100644
+--- a/packages/api/session-controller/README.zh.md
++++ b/packages/api/session-controller/README.zh.md
+@@ -146,3 +146,5 @@ Blockquote 作为普通 prompt 文本传递，不携带 quote 元数据。本地
+ 无。
+ 
+ </details>
++
++客户端控制器通过 `ctx.sessions.registerSource?.(owner, source)` 组合映射来源。来源提供独立的 `ISessions` 适配器、Session 与 Workspace 身份的稳定归属判定，以及在外观服务生命周期内唯一的键。适配器负责转换所有身份元数据，并保留自身绑定的 Context；外观服务不会通过本机 SessionManager 创建远程绑定。目录合并至现有列表，按身份定位的命令交给对应控制器；跨来源的创建复用和子代理地址会被拒绝。撤销来源会移除列表行、释放外观服务持有的引用，并保留身份范围，防止旧导航请求落到本机 Host。搜索仍限于本机；根级权限、附件、模型目录和来源选择界面仍需单独集成。
+diff --git a/packages/api/session-controller/src/client/contract/sessions.ts b/packages/api/session-controller/src/client/contract/sessions.ts
+index c1fede0..585e303 100644
+--- a/packages/api/session-controller/src/client/contract/sessions.ts
++++ b/packages/api/session-controller/src/client/contract/sessions.ts
+@@ -47,6 +47,14 @@ export interface SessionRetainInfo {
+ 
+ /** The sessions-service face injected as `ctx.sessions`. */
+ export interface ISessions {
++  /**
++   * Register an independently owned mapped controller when source composition is supported.
++   * @param ctx - contribution lifetime.
++   * @param source - controller using mapped Client identities.
++   * @returns idempotent withdrawal; reserved identities do not fall back to the local Host.
++   */
++  registerSource?(ctx: Context, source: import('../sessions/sources.ts').SessionSource): () => void
++
+   /** Host catalog and local reference-source counts; navigation belongs to view owners. */
+   readonly list: ObservableSnapshot<SessionListState>
+   /**
+diff --git a/packages/api/session-controller/src/client/index.ts b/packages/api/session-controller/src/client/index.ts
+index b9600f3..f32774d 100644
+--- a/packages/api/session-controller/src/client/index.ts
++++ b/packages/api/session-controller/src/client/index.ts
+@@ -7,6 +7,9 @@ import type {} from '@deepseek-ai/dsh-client-file-upload/client'
+ import { typertOwnedValue } from '@deepseek-ai/dsh-typert-protocol'
+ import { createSessionControlStream } from './transport.ts'
+ import { ClientSessions } from './sessions/service.ts'
++import { SourceSessions } from './sessions/sources.ts'
++export { SourceSessions } from './sessions/sources.ts'
++export type { SessionSource } from './sessions/sources.ts'
+ import type { SessionRemotes } from './sessions/remotes.ts'
+ import type {} from '../remote-events.ts'
+ 
+@@ -112,7 +115,9 @@ export const inject = [
+ export function apply(ctx: Context): void {
+   const remotes = ctx.remote as unknown as SessionRemotes
+   const connection = ctx.get('connection') as ConnectionHandle
+-  const sessions = new ClientSessions(ctx, remotes)
++  const sessions = new ClientSessions(ctx, remotes, false)
++  const sources = new SourceSessions(ctx, sessions)
++  ctx.reflect.provide('sessions', sources, undefined)
+   ctx.remote.$on('api-session/added', (summary) => { sessions.handleSessionAdded(summary) })
+   ctx.remote.$on('api-session/removed', (sessionId) => { sessions.handleSessionRemoved(sessionId) })
+   ctx.remote.$on('api-session/status', (sessionId, running) => {
+diff --git a/packages/api/session-controller/src/client/sessions/service.ts b/packages/api/session-controller/src/client/sessions/service.ts
+index 86b1ad4..42bea06 100644
+--- a/packages/api/session-controller/src/client/sessions/service.ts
++++ b/packages/api/session-controller/src/client/sessions/service.ts
+@@ -103,6 +103,8 @@ export class SessionForkError extends Error {
+ 
+ /** Identity-stable logical binding for one materialized Client Session. */
+ export interface SessionBinding {
++  /** Original Host identity/context for source-aware feature services. Omitted for local bindings. */
++  readonly source?: { readonly sessionId: SessionId; readonly ctx: AgentContext }
+   readonly sessionId: SessionId
+   /** The outward session face only — feature code never sees the concrete class. */
+   readonly session: SessionFace
+@@ -268,10 +270,12 @@ export class ClientSessions implements ISessions {
+   /**
+    * @param ctx - client root context (scope fibers mount under it).
+    * @param remote - generated Remote namespaces shared with every Session.
++   * @param provide - expose this controller directly; false delegates exposure to a source facade.
+    */
+   constructor(
+     private readonly rootCtx: Context,
+     remote: SessionRemotes,
++    provide = true,
+   ) {
+     this.manager = new SessionManager(remote)
+     this.list = createSnapshotStore<SessionListState>({
+@@ -295,7 +299,7 @@ export class ClientSessions implements ISessions {
+       await this.drainScopeDrops()
+       await managerDisposal
+     }, 'session-controller.client.sessions')
+-    rootCtx.reflect.provide('sessions', this, undefined)
++    if (provide) rootCtx.reflect.provide('sessions', this, undefined)
+   }
+ 
+   retain(target: SessionTarget, options: SessionRetainOptions): SessionReference {
+diff --git a/packages/api/session-controller/src/client/sessions/sources.ts b/packages/api/session-controller/src/client/sessions/sources.ts
+new file mode 100644
+index 0000000..22b6a5c
+--- /dev/null
++++ b/packages/api/session-controller/src/client/sessions/sources.ts
+@@ -0,0 +1,212 @@
++/** Source-aware Session facade; adapters retain ownership of their remote contexts and IDs. */
++import type { Context } from '@deepseek-ai/cordis'
++import type { SessionId } from '@deepseek-ai/dsh-session/types'
++import type { WorkspaceId } from '@deepseek-ai/dsh-workspace/types'
++import { createSnapshotStore } from '@deepseek-ai/dsh-client-store'
++import type { ISessions, SessionReference, SessionRetainOptions, SessionTarget } from '../contract/sessions.ts'
++import type { SessionListState } from './service.ts'
++
++/** Independent controller whose catalogs and arguments already use Client-visible identities. */
++export interface SessionSource {
++  readonly key: string
++  /** Must be stable and reserve the whole source identity family, including unlisted children. */
++  ownsSession(id: SessionId): boolean
++  /** Must reserve workspace identities even while the catalog is empty or offline. */
++  ownsWorkspace(id: WorkspaceId): boolean
++  readonly sessions: ISessions
++}
++
++interface Entry { readonly source: SessionSource; active: boolean; unsubscribe: () => void; readonly references: Set<SessionReference> }
++
++/** Composes catalogs without constructing remote bindings through the local SessionManager. */
++export class SourceSessions implements ISessions {
++  readonly list = createSnapshotStore<SessionListState>({ ids: [], byId: {}, phase: 'pending', projectionsBySession: {} })
++  private readonly entries: Entry[] = []
++  private closed = false
++  readonly searchResultLimit: number
++
++  /**
++   * @param ctx - owner of the facade and its subscriptions.
++   * @param local - unchanged local Session Controller.
++   */
++  constructor(ctx: Context, private readonly local: ISessions) {
++    this.searchResultLimit = local.searchResultLimit
++    const unsubscribe = local.list.subscribe(() => this.publish())
++    ctx.effect(() => () => {
++      this.closed = true
++      unsubscribe()
++      for (const entry of this.entries) { entry.active = false; entry.unsubscribe(); for (const ref of [...entry.references]) ref.release() }
++    }, 'session-controller.sources')
++    this.publish()
++  }
++
++  /**
++   * Register a mapped source. Withdrawal removes rows and releases facade-owned references, not Host work.
++   * Ownership predicates remain reserved after withdrawal; source keys cannot be reused in this facade.
++   * @param ctx - contribution lifetime.
++   * @param source - mapped controller and stable ownership predicates.
++   * @returns idempotent withdrawal function.
++   */
++  registerSource(ctx: Context, source: SessionSource): () => void {
++    if (this.closed) throw new Error('Session sources disposed')
++    if (!source.key || this.entries.some(entry => entry.source.key === source.key)) throw new Error('Session source key already reserved')
++    if (source.sessions === this || source.sessions === this.local) throw new Error('Session source must have an independent controller')
++    const entry: Entry = { source, active: true, unsubscribe: () => {}, references: new Set() }
++    this.entries.push(entry)
++    const withdraw = (): void => {
++      if (!entry.active) return
++      entry.active = false
++      entry.unsubscribe()
++      for (const ref of [...entry.references]) ref.release()
++      this.publish()
++    }
++    try {
++      this.publish()
++      entry.unsubscribe = source.sessions.list.subscribe(() => {
++        try { this.publish() } catch (error) { withdraw(); throw error }
++      })
++      ctx.effect(() => withdraw, `session-controller.source.${source.key}`)
++      return withdraw
++    } catch (error) {
++      entry.active = false
++      entry.unsubscribe()
++      this.entries.splice(this.entries.indexOf(entry), 1)
++      this.publish()
++      throw error
++    }
++  }
++
++  retain(target: SessionTarget, options: SessionRetainOptions): SessionReference {
++    const owner = typeof target === 'string' ? this.forSession(target as SessionId) : this.commonOwner(target.parentSessionId, target.childSessionId)
++    const reference = owner.retain(target, options)
++    const entry = this.entries.find(candidate => candidate.active && candidate.source.sessions === owner)
++    if (entry === undefined) return reference
++    let released = false
++    const release = (): void => {
++      if (released) return
++      released = true
++      entry.references.delete(wrapped)
++      reference.release()
++    }
++    const wrapped: SessionReference = {
++      sessionId: reference.sessionId,
++      get binding() {
++        if (released || !entry.active) throw new Error('Session source reference released')
++        return reference.binding
++      },
++      ready: reference.ready.then(binding => {
++        if (released || !entry.active) throw new Error('Session source reference released')
++        return binding
++      }),
++      release,
++      [Symbol.dispose]: release,
++    }
++    void wrapped.ready.catch(() => {})
++    entry.references.add(wrapped)
++    return wrapped
++  }
++
++  async using<T>(target: SessionTarget, options: SessionRetainOptions, operation: (reference: SessionReference) => T | Promise<T>): Promise<T> {
++    const reference = this.retain(target, options)
++    try { await reference.ready; return await operation(reference) } finally { reference.release() }
++  }
++
++  retainInfo(id: SessionId): ReturnType<ISessions['retainInfo']> { return this.forSession(id).retainInfo(id) }
++  subagentAddress(id: SessionId): ReturnType<ISessions['subagentAddress']> { return this.forSession(id).subagentAddress(id) }
++  refreshProjections(id: SessionId): Promise<void> { return this.forSession(id).refreshProjections(id) }
++
++  async refresh(): Promise<void> {
++    this.assertOpen()
++    await Promise.all([this.local, ...this.entries.filter(entry => entry.active).map(entry => entry.source.sessions)].map(controller => controller.refresh()))
++  }
++
++  /** Search remains local; remote search requires an explicit source selection in the consumer. */
++  search(...args: Parameters<ISessions['search']>): ReturnType<ISessions['search']> {
++    this.assertOpen()
++    return this.local.search(...args)
++  }
++
++  create(opts: Parameters<ISessions['create']>[0] = {}): ReturnType<ISessions['create']> {
++    this.assertOpen()
++    const workspaceOwner = opts.workspaceId === undefined ? undefined : this.forWorkspace(opts.workspaceId)
++    const sessionOwner = opts.sessionId === undefined ? undefined : this.forSession(opts.sessionId)
++    if (workspaceOwner && sessionOwner && workspaceOwner !== sessionOwner) throw new Error('Cross-source Session creation refused')
++    return (workspaceOwner ?? sessionOwner ?? this.local).create(opts)
++  }
++
++  fork(opts: Parameters<ISessions['fork']>[0]): ReturnType<ISessions['fork']> { return this.forSession(opts.sessionId).fork(opts) }
++  scope(id: SessionId): ReturnType<ISessions['scope']> { return this.forSession(id).scope(id) }
++  binding(id: SessionId): ReturnType<ISessions['binding']> { return this.forSession(id).binding(id) }
++
++  scopeOf(ctx: Context): ReturnType<ISessions['scopeOf']> {
++    this.assertOpen()
++    for (const entry of this.entries) {
++      if (!entry.active) continue
++      if (entry.source.sessions.sessionOf(ctx) === undefined) continue
++      const id = entry.source.sessions.scopeOf(ctx)
++      if (id !== undefined) {
++        if (this.forSession(id) !== entry.source.sessions) throw new Error('Session scope belongs to another source')
++        return id
++      }
++    }
++    const id = this.local.scopeOf(ctx)
++    if (id !== undefined && this.forSession(id) !== this.local) throw new Error('Foreign Session scope')
++    return id
++  }
++
++  sessionOf(ctx: Context): ReturnType<ISessions['sessionOf']> {
++    const id = this.scopeOf(ctx)
++    return id === undefined ? undefined : this.forSession(id).sessionOf(ctx)
++  }
++
++  private assertOpen(): void { if (this.closed) throw new Error('Session sources disposed') }
++
++  private forSession(id: SessionId): ISessions { return this.owner('session', id) }
++  private forWorkspace(id: WorkspaceId): ISessions { return this.owner('workspace', id) }
++
++  private owner(kind: 'session' | 'workspace', id: SessionId | WorkspaceId): ISessions {
++    this.assertOpen()
++    const owners = this.entries.filter(entry => kind === 'session'
++      ? entry.source.ownsSession(id as SessionId) : entry.source.ownsWorkspace(id as WorkspaceId))
++    if (owners.length > 1) throw new Error('Ambiguous Session source identity')
++    const entry = owners[0]
++    if (entry === undefined) return this.local
++    if (!entry.active) throw new Error('Session source unavailable')
++    return entry.source.sessions
++  }
++
++  private commonOwner(parent: SessionId, child: SessionId): ISessions {
++    const owner = this.forSession(parent)
++    if (owner !== this.forSession(child)) throw new Error('Cross-source subagent address refused')
++    return owner
++  }
++
++  private publish(): void {
++    if (this.closed) return
++    const local = this.local.list.getSnapshot()
++    const next: SessionListState = { ids: [...local.ids], byId: { ...local.byId }, phase: local.phase, projectionsBySession: { ...local.projectionsBySession } }
++    const projections = { ...next.projectionsBySession }
++    for (const id of Object.keys(local.byId)) {
++      if (this.forSession(id as SessionId) !== this.local) throw new Error('Local Session uses a reserved source identity')
++    }
++    for (const entry of this.entries) {
++      if (!entry.active) continue
++      const snapshot = entry.source.sessions.list.getSnapshot()
++      for (const [key, row] of Object.entries(snapshot.byId)) {
++        const id = key as SessionId
++        if (row.id !== id || this.forSession(id) !== entry.source.sessions || next.byId[id] !== undefined) throw new Error('Invalid mapped Session catalog identity')
++        next.byId[id] = row
++      }
++      for (const id of snapshot.ids) {
++        if (snapshot.byId[id] === undefined) throw new Error('Mapped Session list has no summary')
++        next.ids.push(id)
++      }
++      for (const [key, projection] of Object.entries(snapshot.projectionsBySession)) {
++        const id = key as SessionId
++        if (this.forSession(id) !== entry.source.sessions) throw new Error('Foreign Session projection identity')
++        projections[id] = projection
++      }
++    }
++    this.list.set({ ...next, projectionsBySession: projections })
++  }
++}
+diff --git a/packages/api/session-controller/tests/session-sources.client.spec.ts b/packages/api/session-controller/tests/session-sources.client.spec.ts
+new file mode 100644
+index 0000000..f485fc6
+--- /dev/null
++++ b/packages/api/session-controller/tests/session-sources.client.spec.ts
+@@ -0,0 +1,79 @@
++/** Source catalogs, isolated acquisition, and withdrawal routing. */
++import { Context } from '@deepseek-ai/cordis'
++import { describe, expect, it, vi } from 'vitest'
++import { createSnapshotStore } from '@deepseek-ai/dsh-client-store'
++import type { SessionId } from '@deepseek-ai/dsh-session/types'
++import type { WorkspaceId } from '@deepseek-ai/dsh-workspace/types'
++import type { ISessions, SessionReference } from '../src/client/contract/sessions.ts'
++import type { SessionBinding, SessionListState } from '../src/client/sessions/service.ts'
++import { SourceSessions, type SessionSource } from '../src/client/sessions/sources.ts'
++const sid = (value: string): SessionId => value as SessionId
++const wid = (value: string): WorkspaceId => value as WorkspaceId
++function backend(id: string) {
++  const key = sid(id)
++  const list = createSnapshotStore<SessionListState>({ ids: [key], byId: {
++    [key]: { id: key, displayTitle: id, running: false, retainedBy: {}, blank: false, updatedAt: 0 },
++  }, phase: 'ready', projectionsBySession: {} })
++  const binding = { ctx: new Context() } as SessionBinding
++  const release = vi.fn()
++  const reference: SessionReference = { sessionId: key, binding, ready: Promise.resolve(binding), release, [Symbol.dispose]: release }
++  const controller: ISessions = {
++    list, searchResultLimit: 30,
++    retain: vi.fn(() => reference), using: vi.fn(),
++    retainInfo: vi.fn(() => createSnapshotStore({ referenceCount: 0, retainedBy: {} })),
++    create: vi.fn(async () => key), subagentAddress: vi.fn(), refreshProjections: vi.fn(async () => {}),
++    refresh: vi.fn(async () => {}), search: vi.fn(async () => ({ ok: true as const, value: { items: [], hasMore: false } })),
++    fork: vi.fn(async () => key), scope: vi.fn(() => binding.ctx), scopeOf: vi.fn(), sessionOf: vi.fn(), binding: vi.fn(() => binding),
++  }
++  const source: SessionSource = { key: id, ownsSession: value => value.startsWith('remote:'), ownsWorkspace: value => value.startsWith('remote:'), sessions: controller }
++  return { controller, source, list, binding, release }
++}
++describe('Session source routing', () => {
++  it('composes catalogs and preserves the remote binding context while commands route by identity', async () => {
++    const root = new Context(), owner = new Context()
++    const local = backend('local'), remote = backend('remote:s')
++    const facade = new SourceSessions(root, local.controller)
++    try {
++      facade.registerSource(owner, remote.source)
++      expect(facade.list.getSnapshot().ids).toEqual(['local', 'remote:s'])
++      const reference = facade.retain(sid('remote:s'), { source: 'gateway' })
++      expect((await reference.ready).ctx).toBe(remote.binding.ctx)
++      expect(reference.binding).toBe(remote.binding)
++      expect(local.controller.retain).not.toHaveBeenCalled()
++      await facade.create({ workspaceId: wid('remote:w') })
++      expect(remote.controller.create).toHaveBeenCalledWith({ workspaceId: 'remote:w' })
++      facade.binding(sid('remote:s'))
++      facade.refreshProjections(sid('remote:s'))
++      await facade.fork({ sessionId: sid('remote:s') })
++      expect(remote.controller.binding).toHaveBeenCalled()
++      expect(remote.controller.refreshProjections).toHaveBeenCalled()
++      expect(remote.controller.fork).toHaveBeenCalled()
++      await owner.fiber.dispose()
++      expect(remote.release).toHaveBeenCalledOnce()
++      expect(() => reference.binding).toThrow('released')
++      expect(facade.list.getSnapshot().ids).toEqual(['local'])
++      expect(() => facade.retain(sid('remote:unlisted'), { source: 'gateway' })).toThrow('unavailable')
++      expect(() => facade.create({ workspaceId: wid('remote:w') })).toThrow('unavailable')
++      expect(local.controller.create).not.toHaveBeenCalled()
++    } finally { await Promise.all([root.fiber.dispose(), owner.fiber.dispose()]) }
++  })
++  it('refuses cross-source addresses and create reuse, and invalid catalog identities', async () => {
++    const root = new Context(), owner = new Context()
++    const local = backend('local'), remote = backend('remote:s')
++    const facade = new SourceSessions(root, local.controller)
++    try {
++      facade.registerSource(owner, remote.source)
++      expect(() => facade.retain({ parentSessionId: sid('local'), childSessionId: sid('remote:s'), mode: 'unknown' }, { source: 'gateway' })).toThrow('Cross-source')
++      expect(() => facade.create({ workspaceId: wid('remote:w'), sessionId: sid('local') })).toThrow('Cross-source')
++      expect(() => facade.registerSource(owner, remote.source)).toThrow('reserved')
++      const invalid = backend('foreign')
++      expect(() => facade.registerSource(owner, { ...invalid.source, key: 'invalid', ownsSession: value => value.startsWith('different:') })).toThrow('Invalid mapped')
++      expect(facade.list.getSnapshot().ids).toEqual(['local', 'remote:s'])
++      const conflict = backend('remote:s')
++      expect(() => facade.registerSource(owner, { ...conflict.source, key: 'overlap' })).toThrow('Ambiguous')
++      expect(facade.binding(sid('remote:s'))).toBe(remote.binding)
++      expect(() => facade.registerSource(owner, { ...conflict.source, key: 'local-collision', ownsSession: () => true })).toThrow('Local Session')
++      expect(facade.binding(sid('local'))).toBe(local.binding)
++    } finally { await Promise.all([root.fiber.dispose(), owner.fiber.dispose()]) }
++  })
++})
+diff --git a/packages/api/workspace-controller/README.i18n.yaml b/packages/api/workspace-controller/README.i18n.yaml
+index e3cb08a..c54c615 100644
+--- a/packages/api/workspace-controller/README.i18n.yaml
++++ b/packages/api/workspace-controller/README.i18n.yaml
+@@ -32,3 +32,6 @@
+ /workspace-controller/known-limitations-and-deferred-work/dev-note:
+   en: e67f633dc6fe7773
+   zh: e88aeb617ffb74ea
++/workspace-controller/known-limitations-and-deferred-work/client-source-registration:
++  en: 26bc050839b0cdaf
++  zh: 689a1cd084199513
+diff --git a/packages/api/workspace-controller/README.md b/packages/api/workspace-controller/README.md
+index 27c26c7..c637b4a 100644
+--- a/packages/api/workspace-controller/README.md
++++ b/packages/api/workspace-controller/README.md
+@@ -72,3 +72,7 @@ No direct effect; Workspace mutations do not alter model requests.
+ None.
+ 
+ </details>
++
++### Client source registration
++
++`registerWorkspaceSource(ctx, source)` composes source-adapted Workspace rows with the local catalog and routes identity-bearing commands to their owning `IWorkspaces` adapter. Sources must translate all Workspace and Session identities before registration and before remote dispatch. Cross-source reorder/move operations are refused. Registration validation failures roll back rows, keys and identity reservations. Invalid updates from an accepted source withdraw that source and report a diagnostic, preserving local operation; its identities remain reserved until Controller disposal. Registration follows the contributing Cordis fiber; withdrawal removes rows and subscriptions while reserving its key and identity predicates until the Controller is disposed, so stale identities cannot fall back to the local Host. Root create/default initialization remain local. Source availability must be enforced by the adapter; merged lifecycle/error fields continue to describe the local catalog. This extension does not install Session source routing or render a remote Workspace by itself.
+diff --git a/packages/api/workspace-controller/README.zh.md b/packages/api/workspace-controller/README.zh.md
+index 4772d0c..61b3154 100644
+--- a/packages/api/workspace-controller/README.zh.md
++++ b/packages/api/workspace-controller/README.zh.md
+@@ -72,3 +72,7 @@ Documents 查询占用注册表变更队列，因此其他 Workspace 变更（
+ 无。
+ 
+ </details>
++
++### 客户端来源注册
++
++`registerWorkspaceSource(ctx, source)` 将来源适配后的工作区投影与本地目录合并，并将携带身份标识的操作路由至对应的 `IWorkspaces` 适配器。适配器负责转换全部工作区和会话标识，并在远程请求前还原服务端标识；跨来源排序与移动会被拒绝。初始注册校验失败会回滚目录、来源键和身份预留；已接受来源发布非法更新时会撤销该来源并报告诊断，保持本地操作可用，其标识仍预留至控制器释放。注册随贡献者的 Cordis fiber 释放，撤销时移除目录和订阅，但在控制器释放前保留来源键及身份判定规则，阻止旧标识回落至本机。根级创建和默认初始化仍属本机；来源可用性由适配器检查，合并后的生命周期及错误字段仍描述本地目录。此扩展不包含会话来源路由，也不会自行显示远程工作区。
+diff --git a/packages/api/workspace-controller/src/client/index.ts b/packages/api/workspace-controller/src/client/index.ts
+index 7f8246a..89e99b2 100644
+--- a/packages/api/workspace-controller/src/client/index.ts
++++ b/packages/api/workspace-controller/src/client/index.ts
+@@ -16,7 +16,7 @@ export { ClientWorkspaceModel } from './model.ts'
+ export type {
+   WorkspaceFollowSink, WorkspaceListPhase, WorkspaceRemote, WorkspaceSnapshot,
+ } from './model.ts'
+-export { WorkspaceArchiveError, WorkspaceController, WorkspaceCreateError } from './service.ts'
++export { registerWorkspaceSource, WorkspaceArchiveError, WorkspaceController, WorkspaceCreateError } from './service.ts'
+ export type { IWorkspaces, WorkspaceSource } from './service.ts'
+ export type {
+   SessionActivity, SessionActivityItem, SessionActivityKind, SessionActivityKindMap, WorkspaceId,
+@@ -127,3 +127,5 @@ function acceptIncrement(accept: WorkspaceFollowSink, frame: WorkspaceFollowIncr
+ function assertNever(value: never): never {
+   throw new Error(`unreachable Workspace increment: ${JSON.stringify(value)}`)
+ }
++
++export type { WorkspaceSourceRegistration } from './sources.ts'
+diff --git a/packages/api/workspace-controller/src/client/service.ts b/packages/api/workspace-controller/src/client/service.ts
+index 637cc4e..8f1b645 100644
+--- a/packages/api/workspace-controller/src/client/service.ts
++++ b/packages/api/workspace-controller/src/client/service.ts
+@@ -6,6 +6,7 @@ import type { RemoteFailure } from '@deepseek-ai/dsh-typert-protocol'
+ import type { WorkspaceId } from '@deepseek-ai/dsh-workspace/types'
+ import type { WorkspaceView } from '../types.ts'
+ import type { ClientWorkspaceModel, WorkspaceSnapshot } from './model.ts'
++import { WorkspaceSources, type WorkspaceSourceRegistration } from './sources.ts'
+ 
+ /** Structured create failure for callers that distinguish Host business errors. */
+ export class WorkspaceCreateError extends Error {
+@@ -116,7 +117,7 @@ export interface IWorkspaces {
+ 
+ /** Owns the bare Workspace snapshot and Workspace-only commands. */
+ export class WorkspaceController extends Service implements IWorkspaces {
+-  readonly list: WorkspaceSource
++  readonly list: WorkspaceSources
+ 
+   /**
+    * @param ctx - Client root Context.
+@@ -124,7 +125,7 @@ export class WorkspaceController extends Service implements IWorkspaces {
+    */
+   constructor(ctx: Context, private readonly model: ClientWorkspaceModel) {
+     super(ctx, 'workspaces')
+-    this.list = model
++    this.list = new WorkspaceSources(ctx, model)
+   }
+ 
+   async create(input: { path: string }): Promise<WorkspaceView> {
+@@ -140,37 +141,52 @@ export class WorkspaceController extends Service implements IWorkspaces {
+   }
+ 
+   async rename(workspaceId: WorkspaceId, title: string): Promise<WorkspaceView> {
++    const source = this.list.workspace(workspaceId)
++    if (source !== undefined) return source.rename(workspaceId, title)
+     const result = await this.model.rename(workspaceId, title)
+     if (!result.ok) throw commandError('rename', result.error)
+     return result.value.workspace
+   }
+ 
+   async delete(workspaceId: WorkspaceId): Promise<void> {
++    const source = this.list.workspace(workspaceId)
++    if (source !== undefined) return source.delete(workspaceId)
+     const result = await this.model.delete(workspaceId)
+     if (!result.ok) throw commandError('delete', result.error)
+   }
+ 
+   async insertBefore(workspaceId: WorkspaceId, beforeWorkspaceId?: WorkspaceId): Promise<void> {
++    const source = this.list.workspace(workspaceId)
++    if (beforeWorkspaceId !== undefined && this.list.workspace(beforeWorkspaceId) !== source) throw new Error('Cannot reorder across Workspace sources')
++    if (source !== undefined) return source.insertBefore(workspaceId, beforeWorkspaceId)
+     const result = await this.model.insertBefore(workspaceId, beforeWorkspaceId)
+     if (!result.ok) throw commandError('reorder', result.error)
+   }
+ 
+   async archiveSession(sessionId: SessionId, options: { readonly stopActivity?: boolean } = {}): Promise<void> {
++    const source = this.list.session(sessionId)
++    if (source !== undefined) return source.archiveSession(sessionId, options)
+     const result = await this.model.archiveSession(sessionId, options)
+     if (!result.ok) throw new WorkspaceArchiveError(result.error)
+   }
+ 
+   async unarchiveSession(sessionId: SessionId): Promise<void> {
++    const source = this.list.session(sessionId)
++    if (source !== undefined) return source.unarchiveSession(sessionId)
+     const result = await this.model.unarchiveSession(sessionId)
+     if (!result.ok) throw commandError('session unarchive', result.error)
+   }
+ 
+   async pinSession(sessionId: SessionId): Promise<void> {
++    const source = this.list.session(sessionId)
++    if (source !== undefined) return source.pinSession(sessionId)
+     const result = await this.model.pinSession(sessionId)
+     if (!result.ok) throw commandError('session pin', result.error)
+   }
+ 
+   async unpinSession(sessionId: SessionId): Promise<void> {
++    const source = this.list.session(sessionId)
++    if (source !== undefined) return source.unpinSession(sessionId)
+     const result = await this.model.unpinSession(sessionId)
+     if (!result.ok) throw commandError('session unpin', result.error)
+   }
+@@ -180,6 +196,9 @@ export class WorkspaceController extends Service implements IWorkspaces {
+     sessionId: SessionId,
+     beforeSessionId?: SessionId,
+   ): Promise<WorkspaceView> {
++    const source = this.list.workspace(workspaceId)
++    if (this.list.session(sessionId) !== source || (beforeSessionId !== undefined && this.list.session(beforeSessionId) !== source)) throw new Error('Cannot move Session across Workspace sources')
++    if (source !== undefined) return source.insertSessionBefore(workspaceId, sessionId, beforeSessionId)
+     const result = await this.model.insertSessionBefore(workspaceId, sessionId, beforeSessionId)
+     if (!result.ok) throw commandError('move', result.error)
+     return result.value.workspace
+@@ -189,3 +208,15 @@ export class WorkspaceController extends Service implements IWorkspaces {
+ function commandError(operation: string, failure: RemoteFailure): Error {
+   return new Error(`workspace ${operation} failed: ${failure.code}: ${failure.message}`)
+ }
++
++/**
++ * Attach source-adapted Workspace state and commands to the native Controller.
++ * @param ctx - Contribution lifetime and native Controller lookup.
++ * @param source - Identity-owning source adapter; identities stay reserved after disposal.
++ */
++export function registerWorkspaceSource(ctx: Context, source: WorkspaceSourceRegistration): void {
++  const controller = ctx.workspaces
++  if (!(controller instanceof WorkspaceController)) throw new Error('Workspace Controller does not support source registration')
++  if (source.workspaces === controller) throw new Error('Workspace source cannot route to itself')
++  controller.list.register(ctx, source)
++}
+diff --git a/packages/api/workspace-controller/src/client/sources.ts b/packages/api/workspace-controller/src/client/sources.ts
+new file mode 100644
+index 0000000..b07db67
+--- /dev/null
++++ b/packages/api/workspace-controller/src/client/sources.ts
+@@ -0,0 +1,153 @@
++/** Observable Workspace composition and retained source identity reservations. */
++import { notifySubscribers } from '@deepseek-ai/dsh-client-store'
++import type { Context } from '@deepseek-ai/cordis'
++import type { SessionId } from '@deepseek-ai/dsh-session/types'
++import type { WorkspaceId } from '@deepseek-ai/dsh-workspace/types'
++import type { WorkspaceSnapshot } from './model.ts'
++import type { IWorkspaces, WorkspaceSource } from './service.ts'
++
++/** A source adapter owns mapped identities and translates them before remote dispatch. */
++export interface WorkspaceSourceRegistration {
++  readonly key: string
++  /** Must remain valid after withdrawal, reserving the source identity family. */
++  readonly ownsWorkspace: (id: WorkspaceId) => boolean
++  /** Must remain valid after withdrawal, reserving the source identity family. */
++  readonly ownsSession: (id: SessionId) => boolean
++  readonly workspaces: IWorkspaces
++}
++
++interface Registration {
++  readonly source: WorkspaceSourceRegistration
++  active: boolean
++  unsubscribe: () => void
++}
++
++/** Composes projected rows without moving authoritative state between Hosts. */
++export class WorkspaceSources implements WorkspaceSource {
++  private readonly records: Registration[] = []
++  private readonly listeners = new Set<() => void>()
++  private snapshot: WorkspaceSnapshot | undefined
++  private closed = false
++
++  /** @param ctx - Controller lifetime. @param local - Original local projection. */
++  constructor(ctx: Context, private readonly local: WorkspaceSource) {
++    const unsubscribe = local.subscribe(() => { this.invalidate() })
++    ctx.effect(() => () => {
++      this.closed = true
++      unsubscribe()
++      for (const record of this.records) {
++        record.active = false
++        record.unsubscribe()
++      }
++      this.listeners.clear()
++    }, 'workspace-controller.sources')
++  }
++
++  /** @returns identity-stable merged snapshot until a source invalidates. */
++  getSnapshot = (): WorkspaceSnapshot => {
++    if (this.snapshot !== undefined) return this.snapshot
++    const local = this.local.getSnapshot()
++    const sources = this.records.filter(record => record.active).map(record => {
++      const snapshot = record.source.workspaces.list.getSnapshot()
++      for (const row of snapshot.items) {
++        if (this.workspace(row.workspaceId) !== record.source.workspaces) throw new Error('Workspace source published a foreign identity')
++        for (const id of row.sessionIds) {
++          if (this.session(id) !== record.source.workspaces) throw new Error('Workspace source published a foreign Session identity')
++        }
++      }
++      for (const id of [...snapshot.archivedSessionIds, ...snapshot.pinnedSessionIds]) {
++        if (this.session(id) !== record.source.workspaces) throw new Error('Workspace source published a foreign Session identity')
++      }
++      return snapshot
++    })
++    for (const row of local.items) {
++      if (this.workspace(row.workspaceId) !== undefined) throw new Error('Local Workspace uses a reserved source identity')
++      for (const id of row.sessionIds) {
++        if (this.session(id) !== undefined) throw new Error('Local Session uses a reserved source identity')
++      }
++    }
++    for (const id of [...local.archivedSessionIds, ...local.pinnedSessionIds]) {
++      if (this.session(id) !== undefined) throw new Error('Local Session uses a reserved source identity')
++    }
++    this.snapshot = sources.length === 0 ? local : {
++      ...local,
++      items: [...local.items, ...sources.flatMap(source => source.items)],
++      archivedSessionIds: [...local.archivedSessionIds, ...sources.flatMap(source => source.archivedSessionIds)],
++      pinnedSessionIds: [...local.pinnedSessionIds, ...sources.flatMap(source => source.pinnedSessionIds)],
++    }
++    return this.snapshot
++  }
++
++  /** @param listener - Projection invalidation callback. @returns idempotent unsubscribe. */
++  subscribe = (listener: () => void): (() => void) => {
++    if (this.closed) throw new Error('Workspace sources disposed')
++    this.listeners.add(listener)
++    return () => { this.listeners.delete(listener) }
++  }
++
++  /**
++   * Register one source for the contributing fiber's lifetime. Retired keys cannot be reused.
++   * @param ctx - Contribution lifetime.
++   * @param source - Adapter exposing mapped rows and commands.
++   */
++  register(ctx: Context, source: WorkspaceSourceRegistration): void {
++    if (this.closed) throw new Error('Workspace sources disposed')
++    if (!source.key || this.records.some(record => record.source.key === source.key)) throw new Error('Workspace source key already reserved')
++    const record: Registration = { source, active: true, unsubscribe: () => {} }
++    this.records.push(record)
++    try {
++      this.snapshot = undefined
++      this.getSnapshot()
++      record.unsubscribe = source.workspaces.list.subscribe(() => {
++        if (!record.active) return
++        this.snapshot = undefined
++        try {
++          this.getSnapshot()
++        } catch (error) {
++          // Invalid source data withdraws this contribution, not the local catalog.
++          record.active = false
++          record.unsubscribe()
++          console.error('[workspace-controller.sources] source withdrawn after invalid catalog:', source.key, error)
++        }
++        this.invalidate()
++      })
++      ctx.effect(() => () => {
++        record.active = false
++        record.unsubscribe()
++        this.invalidate()
++      }, `workspace-controller.source.${source.key}`)
++    } catch (error) {
++      record.active = false
++      record.unsubscribe()
++      this.records.splice(this.records.indexOf(record), 1)
++      this.snapshot = undefined
++      throw error
++    }
++    this.invalidate()
++  }
++
++  /** @param id - UI Workspace identity. @returns source commands, or undefined for local. */
++  workspace(id: WorkspaceId): IWorkspaces | undefined {
++    return this.resolve(record => record.source.ownsWorkspace(id))
++  }
++
++  /** @param id - UI Session identity. @returns source commands, or undefined for local. */
++  session(id: SessionId): IWorkspaces | undefined {
++    return this.resolve(record => record.source.ownsSession(id))
++  }
++
++  private resolve(matches: (record: Registration) => boolean): IWorkspaces | undefined {
++    if (this.closed) throw new Error('Workspace sources disposed')
++    const owners = this.records.filter(matches)
++    if (owners.length > 1) throw new Error('Ambiguous Workspace source identity')
++    const owner = owners[0]
++    if (owner === undefined) return undefined
++    if (!owner.active) throw new Error('Workspace source is unavailable')
++    return owner.source.workspaces
++  }
++
++  private invalidate(): void {
++    this.snapshot = undefined
++    notifySubscribers(this.listeners, '[workspace-controller.sources]')
++  }
++}
+diff --git a/packages/api/workspace-controller/tests/transport.client.spec.ts b/packages/api/workspace-controller/tests/transport.client.spec.ts
+index ec1b347..0714459 100644
+--- a/packages/api/workspace-controller/tests/transport.client.spec.ts
++++ b/packages/api/workspace-controller/tests/transport.client.spec.ts
+@@ -5,6 +5,7 @@
+  */
+ 
+ import { describe, expect, onTestFinished, vi } from 'vitest'
++import { Context } from '@deepseek-ai/cordis'
+ import { RemoteStreamCarrierError, type ClientRemote } from '@deepseek-ai/dsh-api-gateway/client'
+ import type { SessionId } from '@deepseek-ai/dsh-session/types'
+ import { RemoteError } from '@deepseek-ai/dsh-typert-protocol'
+@@ -361,8 +362,8 @@ describe('WorkspaceController', () => {
+     model.replaceBaseline({ items: [workspace('one')], archivedSessionIds: [], pinnedSessionIds: [] })
+     const controller = new WorkspaceController(client.ctx, model)
+ 
+-    expect(controller.list).toBe(model)
+-    expect(client.ctx.workspaces.list).toBe(model)
++    expect(controller.list.getSnapshot()).toBe(model.getSnapshot())
++    expect(client.ctx.workspaces.list.getSnapshot()).toBe(model.getSnapshot())
+     await expect(controller.initializeDefault(new AbortController().signal)).resolves.toMatchObject({ workspaceId: 'default' })
+     await expect(controller.create({ path: '/work/created' })).resolves.toMatchObject({ workspaceId: 'created' })
+     await expect(controller.rename(wid('one'), 'renamed')).resolves.toMatchObject({ title: 'renamed' })
+@@ -459,3 +460,112 @@ declare module '@deepseek-ai/dsh-workspace/types' {
+     'probe-items': true
+   }
+ }
++
++
++describe('Workspace source composition', () => {
++  it('composes mapped rows, routes commands and retains withdrawn identity reservations', async ({ mock, start }) => {
++    const { remote, client } = await gatewayClient(mock, start)
++    const model = new ClientWorkspaceModel(remote.workspace)
++    model.replaceBaseline({ items: [workspace('local')], archivedSessionIds: [], pinnedSessionIds: [] })
++    const controller = new WorkspaceController(client.ctx, model)
++    const contribution = new Context()
++    const sourceCtx = new Context()
++    onTestFinished(async () => { await contribution.fiber.dispose(); await sourceCtx.fiber.dispose() })
++    const sourceModel = new ClientWorkspaceModel(remote.workspace)
++    sourceModel.replaceBaseline({ items: [workspace('mapped:linux')], archivedSessionIds: [sid('mapped:s')], pinnedSessionIds: [] })
++    const source = new WorkspaceController(sourceCtx, sourceModel)
++    const rename = vi.spyOn(source, 'rename').mockResolvedValue(workspace('mapped:linux'))
++    const pin = vi.spyOn(source, 'pinSession').mockResolvedValue()
++    const changed = vi.fn()
++    controller.list.subscribe(changed)
++    controller.list.register(contribution, {
++      key: 'linux', workspaces: source,
++      ownsWorkspace: id => id.startsWith('mapped:'), ownsSession: id => id.startsWith('mapped:'),
++    })
++    const snapshot = controller.list.getSnapshot()
++    expect(snapshot.items.map(item => item.workspaceId)).toEqual(['local', 'mapped:linux'])
++    expect(snapshot.archivedSessionIds).toEqual(['mapped:s'])
++    expect(controller.list.getSnapshot()).toBe(snapshot)
++    await controller.rename(wid('mapped:linux'), 'renamed')
++    await controller.pinSession(sid('mapped:s'))
++    expect(rename).toHaveBeenCalledWith('mapped:linux', 'renamed')
++    expect(pin).toHaveBeenCalledWith('mapped:s')
++    await expect(controller.insertBefore(wid('mapped:linux'), wid('local'))).rejects.toThrow('across Workspace sources')
++    await expect(controller.insertSessionBefore(wid('local'), sid('mapped:s'))).rejects.toThrow('across Workspace sources')
++    sourceModel.upsertView(workspace('mapped:next'))
++    await Promise.resolve()
++    expect(changed).toHaveBeenCalled()
++    expect(controller.list.getSnapshot().items).toHaveLength(3)
++    await contribution.fiber.dispose()
++    expect(controller.list.getSnapshot().items.map(item => item.workspaceId)).toEqual(['local'])
++    await expect(controller.rename(wid('mapped:never-listed'), 'stale')).rejects.toThrow('unavailable')
++    await expect(controller.pinSession(sid('mapped:s'))).rejects.toThrow('unavailable')
++    expect(mock.log.requests('workspace/rename')).toEqual([])
++    expect(mock.log.requests('workspace/pinSession')).toEqual([])
++    await controller.rename(wid('local'), 'local renamed')
++    expect(mock.log.requests('workspace/rename')).toEqual([{ workspaceId: 'local', title: 'local renamed' }])
++  })
++
++  it('rolls back rejected source rows and identity reservations', async ({ mock, start }) => {
++    const { remote, client } = await gatewayClient(mock, start)
++    const local = new WorkspaceController(client.ctx, new ClientWorkspaceModel(remote.workspace))
++    const sourceCtx = new Context()
++    onTestFinished(async () => { await sourceCtx.fiber.dispose() })
++    const model = new ClientWorkspaceModel(remote.workspace)
++    model.replaceBaseline({ items: [workspace('foreign')], archivedSessionIds: [], pinnedSessionIds: [] })
++    const source = new WorkspaceController(sourceCtx, model)
++    expect(() => local.list.register(sourceCtx, {
++      key: 'invalid', workspaces: source,
++      ownsWorkspace: id => id.startsWith('mapped:'), ownsSession: id => id.startsWith('mapped:'),
++    })).toThrow('foreign identity')
++    expect(local.list.getSnapshot().items).toEqual([])
++    await expect(local.delete(wid('mapped:reserved'))).resolves.toBeUndefined()
++  })
++})
++
++
++describe('Workspace source validation rollback', () => {
++  it('rejects a local identity claim without poisoning local catalogs or dispatch', async ({ mock, start }) => {
++    const { remote, client } = await gatewayClient(mock, start)
++    const model = new ClientWorkspaceModel(remote.workspace)
++    model.replaceBaseline({ items: [workspace('local')], archivedSessionIds: [], pinnedSessionIds: [] })
++    const local = new WorkspaceController(client.ctx, model)
++    const sourceCtx = new Context()
++    onTestFinished(async () => { await sourceCtx.fiber.dispose() })
++    const source = new WorkspaceController(sourceCtx, new ClientWorkspaceModel(remote.workspace))
++    expect(() => local.list.register(sourceCtx, {
++      key: 'collision', workspaces: source, ownsWorkspace: () => true, ownsSession: () => true,
++    })).toThrow('reserved source identity')
++    expect(local.list.getSnapshot().items.map(item => item.workspaceId)).toEqual(['local'])
++    await local.rename(wid('local'), 'usable')
++    expect(mock.log.requests('workspace/rename')).toEqual([{ workspaceId: 'local', title: 'usable' }])
++    local.list.register(sourceCtx, {
++      key: 'collision', workspaces: source, ownsWorkspace: id => id.startsWith('mapped:'), ownsSession: id => id.startsWith('mapped:'),
++    })
++    expect(local.list.getSnapshot().items.map(item => item.workspaceId)).toEqual(['local'])
++  })
++
++  it('withdraws an accepted source after invalid updates while local work remains usable', async ({ mock, start }) => {
++    const { remote, client } = await gatewayClient(mock, start)
++    const model = new ClientWorkspaceModel(remote.workspace)
++    model.replaceBaseline({ items: [workspace('local')], archivedSessionIds: [], pinnedSessionIds: [] })
++    const local = new WorkspaceController(client.ctx, model)
++    const sourceCtx = new Context()
++    onTestFinished(async () => { await sourceCtx.fiber.dispose() })
++    const sourceModel = new ClientWorkspaceModel(remote.workspace)
++    sourceModel.replaceBaseline({ items: [workspace('mapped:valid')], archivedSessionIds: [], pinnedSessionIds: [] })
++    const source = new WorkspaceController(sourceCtx, sourceModel)
++    local.list.register(sourceCtx, {
++      key: 'mapped', workspaces: source, ownsWorkspace: id => id.startsWith('mapped:'), ownsSession: id => id.startsWith('mapped:'),
++    })
++    const report = vi.spyOn(console, 'error').mockImplementation(() => {})
++    sourceModel.upsertView(workspace('local'))
++    await Promise.resolve()
++    expect(report).toHaveBeenCalledWith('[workspace-controller.sources] source withdrawn after invalid catalog:', 'mapped', expect.any(Error))
++    report.mockRestore()
++    expect(local.list.getSnapshot().items.map(item => item.workspaceId)).toEqual(['local'])
++    await expect(local.rename(wid('mapped:valid'), 'blocked')).rejects.toThrow('unavailable')
++    await local.rename(wid('local'), 'still usable')
++    expect(mock.log.requests('workspace/rename')).toEqual([{ workspaceId: 'local', title: 'still usable' }])
++  })
++})
+diff --git a/packages/api/workspace-controller/tsconfig.client.json b/packages/api/workspace-controller/tsconfig.client.json
+index b7174af..41b4858 100644
+--- a/packages/api/workspace-controller/tsconfig.client.json
++++ b/packages/api/workspace-controller/tsconfig.client.json
+@@ -9,6 +9,7 @@
+     "src/client/index.ts",
+     "src/client/model.ts",
+     "src/client/service.ts",
++    "src/client/sources.ts",
+     "src/default-workspace.ts",
+     "src/types.ts"
+   ],
+diff --git a/packages/client/ui-agent-preset/src/client/index.ts b/packages/client/ui-agent-preset/src/client/index.ts
+index b9e1363..34417bc 100644
+--- a/packages/client/ui-agent-preset/src/client/index.ts
++++ b/packages/client/ui-agent-preset/src/client/index.ts
+@@ -88,13 +88,14 @@ export function apply(ctx: ClientContext): void {
+     const existing = seats.get(binding)
+     if (existing !== undefined) return existing
+     const seat = new AgentPresetSeatController(ctx, () => {
++      if (binding.source !== undefined) return undefined
+       if (ctx.sessions.binding(binding.sessionId) !== binding) return undefined
+       const summary = ctx.sessions.list.getSnapshot().byId[binding.sessionId]
+       return summary !== undefined
+         && (ctx.sessions.retainInfo(binding.sessionId).getSnapshot().retainedBy.mainView ?? 0) > 0
+         ? summary
+         : undefined
+-    }, staged)
++    }, binding.source === undefined ? staged : { id: undefined, introduce: false }, () => binding.source === undefined)
+     seats.set(binding, seat)
+     const dispose = binding.ctx.effect(() => {
+       const stop = ctx.sessions.list.subscribe(() => { void seat.apply() })
+@@ -120,7 +121,7 @@ export function apply(ctx: ClientContext): void {
+   const mainBlank = () => Object.values(ctx.sessions.list.getSnapshot().byId)
+     .find((session) => {
+       /* v8 ignore next -- retained source counts omit zero-valued entries. */
+-      return session.blank && (session.retainedBy.mainView ?? 0) > 0
++      return session.blank && ctx.sessions.binding(session.id)?.source === undefined && (session.retainedBy.mainView ?? 0) > 0
+     })
+   const mainBlankSeat = (): AgentPresetSeatController | undefined => {
+     const summary = mainBlank()
+@@ -258,7 +259,7 @@ export function apply(ctx: ClientContext): void {
+   /** Capture the exact blank Session one Settings action may update. */
+   const captureBlankSessionSync = (): ((id: string) => Promise<string | undefined>) => {
+     const summary = Object.values(ctx.sessions.list.getSnapshot().byId)
+-      .find(session => session.blank && (session.retainedBy.mainView ?? 0) > 0)
++      .find(session => session.blank && ctx.sessions.binding(session.id)?.source === undefined && (session.retainedBy.mainView ?? 0) > 0)
+     const binding = summary === undefined ? undefined : ctx.sessions.binding(summary.id)
+     const seat = binding === undefined ? undefined : seatFor(binding)
+     const sessionId = seat?.blankSessionId()
+diff --git a/packages/client/ui-agent-preset/src/client/seat-store.ts b/packages/client/ui-agent-preset/src/client/seat-store.ts
+index a19d7a1..ac972b8 100644
+--- a/packages/client/ui-agent-preset/src/client/seat-store.ts
++++ b/packages/client/ui-agent-preset/src/client/seat-store.ts
+@@ -85,6 +85,7 @@ export class AgentPresetSeatController {
+       'id' | 'blank' | 'projectionValues'
+     > | undefined,
+     private readonly staged: AgentPresetStage = { id: undefined, introduce: false },
++    private readonly enabled: () => boolean = () => true,
+   ) {}
+ 
+   private set(patch: Partial<AgentPresetSeatState>): void {
+@@ -101,6 +102,7 @@ export class AgentPresetSeatController {
+   * @returns once the snapshot reflects the host.
+   */
+   async load(): Promise<void> {
++    if (!this.enabled()) return
+     const generation = ++this.loadGeneration
+     const roster = await readRoster(this.ctx)
+     if (generation !== this.loadGeneration) return
+@@ -138,6 +140,7 @@ export class AgentPresetSeatController {
+    * @returns how the pick settled; a refusal carries its text.
+    */
+   async select(id: string): Promise<AgentPresetApplyOutcome> {
++    if (!this.enabled()) return { kind: 'refused', reason: 'Preset selection is unavailable for this Session source' }
+     if (this.store.getSnapshot().busy) return UNCHANGED
+     this.stage(id)
+     return await this.apply()
+@@ -213,6 +216,7 @@ export class AgentPresetSeatController {
+    * @returns how this attempt settled; only a Host commit of the staged preset is applied.
+    */
+   async apply(): Promise<AgentPresetApplyOutcome> {
++    if (!this.enabled()) return UNCHANGED
+     if (this.store.getSnapshot().busy) return UNCHANGED
+     const staged = this.staged.id
+     const session = this.currentSession()
+diff --git a/packages/client/ui-agent-preset/tests/settings-store.client.spec.ts b/packages/client/ui-agent-preset/tests/settings-store.client.spec.ts
+index 73f412f..a25966c 100644
+--- a/packages/client/ui-agent-preset/tests/settings-store.client.spec.ts
++++ b/packages/client/ui-agent-preset/tests/settings-store.client.spec.ts
+@@ -5,7 +5,7 @@
+  * preference through a narrow field writer in the same settings namespace.
+  */
+ 
+-import { describe, expect, it } from 'vitest'
++import { describe, expect, it, vi } from 'vitest'
+ import type { Context as ClientContext } from '@deepseek-ai/cordis'
+ import type { RemoteErrorCode } from '@deepseek-ai/dsh-api-remotes/client'
+ import { RemoteError } from '@deepseek-ai/dsh-client-test-runtime'
+@@ -522,3 +522,15 @@ function remoteRoster(defaultId: string) {
+     },
+   }
+ }
++
++it('keeps source-disabled preset seats empty and never reads or writes the local Host', async () => {
++  const list = vi.fn(), select = vi.fn()
++  const seat = new AgentPresetSeatController({ remote: { agentPresets: { list, select } } } as never,
++    () => ({ id: 'mapped', blank: true }) as never, { id: 'local-preset', introduce: false }, () => false)
++  await seat.load()
++  expect(seat.store.getSnapshot().options).toEqual([])
++  await expect(seat.select('local-preset')).resolves.toMatchObject({ kind: 'refused' })
++  await seat.apply()
++  expect(list).not.toHaveBeenCalled()
++  expect(select).not.toHaveBeenCalled()
++})
+diff --git a/packages/client/ui-chat/src/client/apply.ts b/packages/client/ui-chat/src/client/apply.ts
+index 7e4a3a5..0384973 100644
+--- a/packages/client/ui-chat/src/client/apply.ts
++++ b/packages/client/ui-chat/src/client/apply.ts
+@@ -230,7 +230,7 @@ export function apply(ctx: Context): void {
+     inject: (sessionId: SessionId): ChatFlowDataInjected => {
+       const binding = ctx.sessions.binding(sessionId)
+       if (binding === undefined) throw new Error(`ui-chat: unknown session "${sessionId}"`)
+-      return { ...nodeSources(binding), hooks: { presentation, connectionState } }
++      return { ...nodeSources(binding), hooks: { presentation, connectionState: binding.source === undefined ? connectionState : (binding.source.ctx.get('connection') as ConnectionHandle).state } }
+     },
+   }, ChatFlow))
+ 
+@@ -272,6 +272,7 @@ export function apply(ctx: Context): void {
+           // its top or at line 400, so the same tab is revealed and told where
+           // to land.
+           openFile: async (path, options) => {
++            if (binding.source !== undefined) throw new Error('Remote file preview is not enabled')
+             const cwd = ctx.sessions.list.getSnapshot().byId[sessionId]?.cwd
+             const current = session.projections.faceOf('workingDirectory').getSnapshot() as string | null | undefined
+             const url = fileAddressFor(sessionId, cwd, resolveWorkspacePath(current ?? undefined, path))
+diff --git a/packages/client/ui-conversation/src/client/service.ts b/packages/client/ui-conversation/src/client/service.ts
+index 27cae03..ca857af 100644
+--- a/packages/client/ui-conversation/src/client/service.ts
++++ b/packages/client/ui-conversation/src/client/service.ts
+@@ -401,11 +401,16 @@ export class ConversationController extends Service implements IConversation {
+       try {
+         if (controller.signal.aborted
+           || this.fileUploadOperations.get(attachment.id)?.controller !== controller) return
++        const binding = this.ctx.sessions.binding(sessionId)
++        const sourceUpload = binding?.source?.ctx.get('fileUpload') as import('@deepseek-ai/dsh-client-file-upload/client').FileUploadService | undefined
++        if (binding?.source !== undefined && sourceUpload === undefined) throw new Error('Remote attachment upload is unavailable')
++        const uploads = sourceUpload ?? this.ctx.fileUpload
++        const uploadSessionId = binding?.source?.sessionId ?? sessionId
+         const result = attachment.kind === 'image'
+-          ? await this.ctx.fileUpload.uploadImage(
+-            sessionId, attachment.file, imageMediaType(attachment.file.type), name, controller.signal, onProgress,
++          ? await uploads.uploadImage(
++            uploadSessionId, attachment.file, imageMediaType(attachment.file.type), name, controller.signal, onProgress,
+           )
+-          : await this.ctx.fileUpload.upload(sessionId, attachment.file, name, controller.signal, onProgress)
++          : await uploads.upload(uploadSessionId, attachment.file, name, controller.signal, onProgress)
+         if (this.fileUploadOperations.get(attachment.id)?.controller !== controller) return
+         this.fileUploads.update((draft) => {
+           if (!(attachment.id in draft)) return
+diff --git a/packages/client/ui-conversation/tests/service-orchestration.client.spec.ts b/packages/client/ui-conversation/tests/service-orchestration.client.spec.ts
+index e29bf0a..9335e86 100644
+--- a/packages/client/ui-conversation/tests/service-orchestration.client.spec.ts
++++ b/packages/client/ui-conversation/tests/service-orchestration.client.spec.ts
+@@ -1195,3 +1195,18 @@ it('reports nothing for a submission whose Session facts were not captured', ()
+   reportMessageSubmission(ctx, { timestamp: 1, mode: 'queue', source: 'click' })
+   expect(track).not.toHaveBeenCalled()
+ })
++
++it('does not send source attachments to the local upload service, including when the source refuses them', async () => {
++  const b = await bench()
++  const source = new Context()
++  const upload = vi.fn(async (_sessionId: string) => { throw new Error('remote uploads disabled') })
++  source.provide('fileUpload', { upload, uploadImage: upload } as never)
++  const localUpload = vi.spyOn(b.runtime.fileUpload, 'upload')
++  Object.assign(b.runtime.sessions.binding('s1')!, { source: { sessionId: 'raw', ctx: source } })
++  try {
++    const [draft] = b.root.createDrafts('s1' as SessionId, [new File(['body'], 'file.txt')], UPLOAD_IMAGES)
++    await vi.waitFor(() => expect(b.root.fileUploads.getSnapshot()[draft!.id]).toMatchObject({ status: 'error', message: 'remote uploads disabled' }))
++    expect(upload.mock.calls[0]?.[0]).toBe('raw')
++    expect(localUpload).not.toHaveBeenCalled()
++  } finally { await b.runtime.dispose(); await source.fiber.dispose() }
++})
+diff --git a/packages/client/ui-model-selection/src/client/catalog.ts b/packages/client/ui-model-selection/src/client/catalog.ts
+index cbc9264..cc1053d 100644
+--- a/packages/client/ui-model-selection/src/client/catalog.ts
++++ b/packages/client/ui-model-selection/src/client/catalog.ts
+@@ -1,5 +1,6 @@
+ /** One Host-generation model catalog shared by every Session selector. */
+ 
++import type { ClientRemote } from '@deepseek-ai/dsh-api-gateway/client'
+ import type { Context as ClientContext } from '@deepseek-ai/cordis'
+ import type { ModelCatalog, ModelSelection, ModelProviderGroup } from '@deepseek-ai/dsh-api-remotes/client'
+ import { createSnapshotStore, type SnapshotStore } from '@deepseek-ai/dsh-client-store'
+@@ -38,7 +39,7 @@ export class ModelCatalogDirectory {
+    * @param ctx - the providing plugin's context, whose `remote.session`
+    * namespace carries the Host-generation catalog.
+    */
+-  constructor(private readonly ctx: ClientContext) {}
++  constructor(private readonly ctx: ClientContext, private readonly remote?: Pick<ClientRemote['session'], 'modelCatalog'>) {}
+ 
+   /**
+    * Return the current generation's catalog, sharing its one in-flight load.
+@@ -53,7 +54,7 @@ export class ModelCatalogDirectory {
+       draft.status = 'loading'
+       draft.error = null
+     })
+-    const operation = this.ctx.remote.session.modelCatalog().then((response) => {
++    const operation = (this.remote ?? this.ctx.remote.session).modelCatalog().then((response) => {
+       if (!response.ok) {
+         throw new Error(`${response.error.code}: ${response.error.message}`)
+       }
+diff --git a/packages/client/ui-model-selection/src/client/service.ts b/packages/client/ui-model-selection/src/client/service.ts
+index 5052388..4835e30 100644
+--- a/packages/client/ui-model-selection/src/client/service.ts
++++ b/packages/client/ui-model-selection/src/client/service.ts
+@@ -15,6 +15,7 @@
+ import type {} from '@deepseek-ai/dsh-client-product-analytics/client'
+ import { Service } from '@deepseek-ai/cordis'
+ import type { Context } from '@deepseek-ai/cordis'
++import type { ClientRemote } from '@deepseek-ai/dsh-api-gateway/client'
+ import type { SessionBinding } from '@deepseek-ai/dsh-api-session-controller/client'
+ import type { SessionId } from '@deepseek-ai/dsh-session/types'
+ import { WeakMapWithValues } from '@deepseek-ai/dsh-util-values'
+@@ -73,15 +74,26 @@ export class ModelDirectoryResolver extends Service {
+     if (binding === undefined) throw new Error(`ui-model-selection: session "${String(sessionId)}" resolved no binding`)
+     const existing = live.directories.get(binding)
+     if (existing !== undefined) return existing
++    const sourceRemote = binding.source?.ctx.get('remote') as ClientRemote | undefined
++    if (binding.source !== undefined && sourceRemote === undefined) throw new Error('Session source Remote is unavailable')
++    const remoteSession = sourceRemote?.session ?? this.ctx.remote.session
++    const catalog = sourceRemote === undefined ? this.catalog : new ModelCatalogDirectory(binding.source!.ctx, remoteSession)
+     const directory = new ModelDirectory(
+-      this.ctx.remote.session,
+-      sessionId,
++      remoteSession,
++      binding.source?.sessionId ?? sessionId,
+       () => sessions.subagentAddress(sessionId) === undefined,
+-      this.catalog,
++      catalog,
+       binding.session.projections.faceOf('modelSelection'),
+       () => binding.session.getSnapshot().blank,
+       (name, attributes) => this.ctx.get('productAnalytics')?.track(name, attributes),
+     )
++    if (sourceRemote !== undefined) {
++      actx.on('connection/reset', () => { catalog.resetGeneration(); directory.resetConnected() })
++      for (const event of ['llm/adapters-updated', 'llm/models-updated', 'settings/document-updated', 'credentials/record-updated', 'credentials/reference-updated'] as const) {
++        const unsubscribe = sourceRemote.$on(event, () => { catalog.refresh() })
++        actx.effect(() => unsubscribe, 'ui-model-selection: source catalog')
++      }
++    }
+     live.directories.set(binding, directory)
+     actx.effect(() => () => {
+       directory.dispose()
+diff --git a/packages/client/ui-model-selection/tests/browser-plugin.client.spec.ts b/packages/client/ui-model-selection/tests/browser-plugin.client.spec.ts
+index 02d2d42..13c7228 100644
+--- a/packages/client/ui-model-selection/tests/browser-plugin.client.spec.ts
++++ b/packages/client/ui-model-selection/tests/browser-plugin.client.spec.ts
+@@ -147,6 +147,7 @@ async function bench(locale: 'zh' | 'en' = 'zh') {
+       projections: { faceOf: () => SnapshotStore<ModelSelectionProjection | undefined> }
+     }
+     ctx: Context
++    source?: { readonly sessionId: SessionId; readonly ctx: Context }
+   }>()
+   const addressed = new Set<SessionId>()
+   ctx.provide('sessions', {
+@@ -161,7 +162,7 @@ async function bench(locale: 'zh' | 'en' = 'zh') {
+   const fiber = ctx.plugin({ inject: [...inject], apply })
+   await fiber.await()
+   await ctx.plugin(function probe() {}).await()
+-  const mint = (key: string, blank = false) => {
++  const mint = (key: string, blank = false, source?: { sessionId: SessionId; ctx: Context }) => {
+     const id = sid(key)
+     const handle = createScope(ctx, id)
+     scopes.set(id, handle.ctx)
+@@ -174,6 +175,7 @@ async function bench(locale: 'zh' | 'en' = 'zh') {
+       sessionId: id,
+       session: { sessionId: id, getSnapshot: () => ({ blank }), projections: { faceOf: () => projection } },
+       ctx: handle.ctx,
++      ...(source === undefined ? {} : { source }),
+     }
+     bindings.set(id, binding)
+     handle.ctx.effect(() => () => {
+@@ -588,3 +590,22 @@ it.each([false, true])('reports accepted switches with blank=%s and no refused s
+     expect(b.track).not.toHaveBeenCalled()
+   } finally { await scope.fiber.dispose(); await b.ctx.fiber.dispose() }
+ })
++
++it('loads and selects through the binding source with its original Host identity, never the local catalog', async () => {
++  const b = await bench()
++  const source = new Context()
++  const modelCatalog = vi.fn(async () => ({ ok: true as const, value: { default: { provider: 'linux', model: 'remote' }, routableProviders: ['linux'], groups: [{ id: 'linux', name: 'Linux', models: [{ id: 'remote', name: 'Remote' }] }], failures: [] } }))
++  const selectModel = vi.fn(async () => ({ ok: true as const, value: { selected: { provider: 'linux', model: 'remote' } } }))
++  source.provide('remote', { session: { modelCatalog, selectModel }, $on: () => () => {} } as never)
++  const scope = b.mint('mapped', false, { sessionId: sid('raw'), ctx: source })
++  try {
++    const localModels = b.calls.models
++    const face = b.seat().inject!(sid('mapped'))
++    face.load()
++    await vi.waitFor(() => expect(face.directory.getSnapshot().groups[0]?.id).toBe('linux'))
++    await face.select({ provider: 'linux', model: 'remote' })
++    expect(selectModel).toHaveBeenCalledWith({ sessionId: 'raw', provider: 'linux', model: 'remote' })
++    expect(b.calls.select).toBe(0)
++    expect(b.calls.models).toBe(localModels)
++  } finally { await scope.fiber.dispose(); await b.ctx.fiber.dispose(); await source.fiber.dispose() }
++})
+diff --git a/packages/client/ui-session-status/src/client/acknowledge.ts b/packages/client/ui-session-status/src/client/acknowledge.ts
+index 5c50563..4bd5d91 100644
+--- a/packages/client/ui-session-status/src/client/acknowledge.ts
++++ b/packages/client/ui-session-status/src/client/acknowledge.ts
+@@ -37,7 +37,7 @@ export function installReadingAcknowledgements(ctx: Context, sessions: Pick<ISes
+   const acknowledge = (): void => {
+     const snapshot = reading.state.getSnapshot()
+     const record = selected === undefined ? undefined : snapshot.items[selected]
+-    if (!visible() || !snapshot.ready || binding?.session.getSnapshot().openState !== 'open') return
++    if (!visible() || !snapshot.ready || binding?.source !== undefined || binding?.session.getSnapshot().openState !== 'open') return
+     if (record === undefined || pending !== undefined || attemptedTurn === record.completedTurn) return
+     const clearing = entered === record.sessionId
+     if (!clearing && record.completedTurn <= record.readTurn) return
+diff --git a/packages/client/ui-session-status/src/client/status.ts b/packages/client/ui-session-status/src/client/status.ts
+index 80aeaf3..22b2ed2 100644
+--- a/packages/client/ui-session-status/src/client/status.ts
++++ b/packages/client/ui-session-status/src/client/status.ts
+@@ -125,6 +125,7 @@ export class UiSessionStatus extends Service implements HostObservable<SessionSt
+    * @throws when reading is not synchronized or the Host or carrier rejects; reconnect to refresh an unknown outcome.
+    */
+   async mark(sessionId: SessionId, unread: boolean): Promise<void> {
++    if (this.sessions.binding(sessionId)?.source !== undefined) throw new Error('Remote reading marks are not enabled')
+     await this.reading.mark(sessionId, unread)
+   }
+ 
+diff --git a/packages/client/ui-user-questions/src/client/index.ts b/packages/client/ui-user-questions/src/client/index.ts
+index 0f8255d..1779b03 100644
+--- a/packages/client/ui-user-questions/src/client/index.ts
++++ b/packages/client/ui-user-questions/src/client/index.ts
+@@ -214,6 +214,9 @@ async function answerQuestion(
+ ): Promise<ClientQuestionAnswer> {
+   const sessionId = ctx.sessions.scopeOf(owner)
+   if (sessionId === undefined) return next()
++  const source = ctx.sessions.binding(sessionId)?.source
++  const remote = source === undefined ? ctx.remote : source.ctx.get('remote') as typeof ctx.remote
++  const rawSessionId = source?.sessionId ?? sessionId
+   const callId = request.wait?.callId
+   const card = cards.ensure(sessionId, request.questions, callId)
+   const claimLifetime = new AbortController()
+@@ -224,7 +227,7 @@ async function answerQuestion(
+   let delegateRequest: (() => void) | undefined
+   const releaseClaim = request.wait?.timed === true && callId !== undefined
+     ? ctx.effect(() => {
+-      claim = ctx.remote.userQuestions.attachWait(sessionId, callId, claimSignal)
++      claim = remote.userQuestions.attachWait(rawSessionId, callId, claimSignal)
+       return async () => {
+         delegateRequest?.()
+         claimLifetime.abort()
+@@ -292,7 +295,11 @@ function publishContinuedQuestions(ctx: ClientContext, cards: QuestionCards): ()
+     return result.value
+   }
+   const rpcFor = (sessionId: SessionId, callId: ToolCallId): QuestionRpcChannel => ({
+-    answer: async answer => unwrap(await ctx.remote.userQuestions.answer(sessionId, callId, answer)),
++    answer: async answer => {
++      const source = ctx.sessions.binding(sessionId)?.source
++      const remote = source === undefined ? ctx.remote : source.ctx.get('remote') as typeof ctx.remote
++      return unwrap(await remote.userQuestions.answer(source?.sessionId ?? sessionId, callId, answer))
++    },
+   })
+ 
+   const reconcile = (): void => {
+diff --git a/packages/client/ui-user-questions/tests/browser-plugin.client.spec.ts b/packages/client/ui-user-questions/tests/browser-plugin.client.spec.ts
+index 466624e..1b163b3 100644
+--- a/packages/client/ui-user-questions/tests/browser-plugin.client.spec.ts
++++ b/packages/client/ui-user-questions/tests/browser-plugin.client.spec.ts
+@@ -767,3 +767,29 @@ describe('apply', () => {
+     expect(b.pending.getSnapshot()).toEqual([])
+   })
+ })
++
++it('claims and answers a source question using its own Remote and raw Session identity', async () => {
++  const b = await bench(true, [CONTINUED])
++  const owner = new Context()
++  const abort = new AbortController()
++  const attachWait = vi.fn(() => ({
++    dispose: vi.fn(), send: () => {}, end: () => {},
++    [Symbol.asyncIterator]: () => ({ next: () => {
++      abort.abort()
++      return Promise.resolve({ done: false as const, value: { remainingMs: 60_000 } })
++    } }),
++  }))
++  const answer = vi.fn(async () => ({ ok: true as const, value: true }))
++  owner.provide('remote', { userQuestions: { attachWait, answer } } as never)
++  const binding = b.binding(SESSION_ID)!
++  b.binding.mockImplementation(id => id === SESSION_ID ? { ...binding, source: { sessionId: 'raw', ctx: owner } } : undefined)
++  try {
++    await expect(b.invoke(b.agent, { ...timed(), signal: abort.signal }, async () => ANSWER)).rejects.toMatchObject({ code: 'ASK_ABORTED' })
++    const card = b.pending.getSnapshot()[0]!
++    await card.answer(ANSWER)
++    expect(attachWait).toHaveBeenCalledWith('raw', CALL, expect.any(AbortSignal))
++    expect(answer).toHaveBeenCalledWith('raw', CALL, ANSWER)
++    expect(b.remoteQuestions.attachWait).not.toHaveBeenCalled()
++    expect(b.remoteQuestions.answer).not.toHaveBeenCalled()
++  } finally { await b.fiber.dispose(); await owner.fiber.dispose() }
++})

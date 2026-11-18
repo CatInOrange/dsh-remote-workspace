@@ -1,5 +1,7 @@
 # Harness remote workspace plugin
 
+> **Native test development:** the new native implementation, matching desktop patch, build workflow and limitations are documented in [BUILD-NATIVE.md](BUILD-NATIVE.md). The default `0.1.0-preview.1` entry below is still the older embedded-page preview; it is not the native replacement.
+
 **Experimental preview for Windows testing.** This plugin adds a **Linux workspace** entry next to the existing local navigation in DeepSeek Harness Desktop. It embeds one remote Harness server's original UI in an isolated Electron guest. Messages, models, tools, session history and memory run on that remote server, not through a second local model.
 
 This is an embedded remote UI, **not a merged native workspace tree**: local workspaces remain in the outer sidebar, while the remote UI has its own sidebar and may show multiple workspaces from that server. Selecting only one remote workspace is not yet implemented. It has not been qualified on Windows.

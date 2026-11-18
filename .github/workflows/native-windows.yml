@@ -1,0 +1,83 @@
+name: Native workspace Windows test build
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: native-windows-test
+  cancel-in-progress: false
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 180
+    env:
+      DSH_TELEMETRY_DISABLED: '1'
+      DSH_NATIVE_TEST_BUILD: '1'
+      DSH_GATE_CONCURRENCY: '1'
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          path: plugin
+          persist-credentials: false
+      - uses: actions/checkout@v7.0.1
+        with:
+          repository: deepseek-ai/deepseek-harness
+          ref: 39163dd30f703a79079e2d2446545cff3c453738
+          path: harness
+          persist-credentials: false
+      - uses: pnpm/action-setup@v5.0.0
+        with:
+          package_json_file: harness/package.json
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: '24'
+      - name: Apply reviewed native source patch
+        run: |
+          $env:DSH_NATIVE_ROOT = (Resolve-Path harness).Path
+          git -C harness apply --check ../plugin/patches/native-client.patch
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git -C harness apply ../plugin/patches/native-client.patch
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node plugin/scripts/prepare-native-test-build.mjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "DSH_NATIVE_ROOT=$env:DSH_NATIVE_ROOT" >> $env:GITHUB_ENV
+      - name: Install locked dependencies
+        working-directory: harness
+        run: pnpm install --frozen-lockfile
+      - name: Package unsigned native desktop
+        working-directory: harness
+        run: pnpm --dir apps/desktop run package:win:x64:unsigned
+      - name: Build and check native plugin
+        working-directory: plugin
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm run check:native
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm run test:native
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm run build:native
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm pack ./native-dist --pack-destination .
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Publish test artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: native-workspace-windows-x64
+          if-no-files-found: error
+          retention-days: 30
+          path: |
+            harness/apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts/*.exe
+            harness/apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts/*.zip
+            plugin/dsh-remote-workspace-0.2.0-native.0.tgz
+      - name: Retain diagnostics
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: native-windows-build-diagnostics
+          if-no-files-found: ignore
+          retention-days: 7
+          path: harness/apps/desktop/.desktop-build/packaging-runs/
